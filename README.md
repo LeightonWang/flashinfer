@@ -1,5 +1,7 @@
 # [FlashInfer AI Kernel Generation Contest @ MLSys 2026](http://mlsys26.flashinfer.ai/)
 
+> Some of the original content of this README is not applicable. So I made some edits to make it work.
+
 Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
 
 ---
@@ -43,8 +45,9 @@ Click "Use this template" or fork this repository to create your solution repo.
 ```bash
 conda create -n fi-bench python=3.12
 conda activate fi-bench
-pip install flashinfer-bench modal
+pip install git+https://github.com/flashinfer-ai/flashinfer-bench.git@main modal
 ```
+> Edited: Use source from github instead of PyPI since the latest version on PyPI is 0.1.0 which lacks `flashinfer_moe.agents` module.
 
 ### 3. Download the TraceSet
 
