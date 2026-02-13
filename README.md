@@ -54,6 +54,9 @@ pip install git+https://github.com/flashinfer-ai/flashinfer-bench.git@main modal
 We provide kernel definitions and workloads in [FlashInfer-Trace format](https://bench.flashinfer.ai/docs/flashinfer-trace). Clone the competition dataset from HuggingFace:
 
 ```bash
+# You might need to install git-lfs first
+apt-get update && apt-get install -y git-lfs
+# Install
 git lfs install
 git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
 ```

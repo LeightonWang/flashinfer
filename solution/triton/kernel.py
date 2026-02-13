@@ -4,10 +4,107 @@ import triton
 import triton.language as tl
 
 
-# Fused per-expert kernel:
-# - On-the-fly FP8 block dequantization for hidden_states, W13 (gate/up), and W2 (down)
-# - GEMM1 (split into two heads) -> SwiGLU -> GEMM2
-# - Accumulate per-token with routing weights into output
+def _gpu_supports_fp8() -> bool:
+    """Check if current GPU supports fp8e4nv (SM >= 89, i.e. Hopper/Blackwell)."""
+    if not torch.cuda.is_available():
+        return False
+    cc = torch.cuda.get_device_capability()
+    return cc[0] > 8 or (cc[0] == 8 and cc[1] >= 9)
+
+
+# ============================================================
+# BF16 fallback kernel for A100 (no FP8 types)
+# Data is pre-dequantized to bf16/fp32 on the host side
+# ============================================================
+@triton.jit
+def _moe_le_fused_kernel_bf16(
+    # Hidden states (pre-dequantized to bf16)
+    hs_ptr,                                          # [T, H], bf16
+    T, H, I,
+    # Token index list for this local expert
+    tok_idx_ptr,                                     # [Tk], int32
+    Tk,
+    # Expert weights (pre-dequantized to bf16)
+    w13_ptr,                                         # [2I, H], bf16
+    w2_ptr,                                          # [H, I], bf16
+    # Routing weights for tokens of this expert
+    w_tok_ptr,                                       # [Tk], fp32
+    # Output (accumulating)
+    out_ptr,                                         # [T, H], fp32
+    # Strides
+    stride_hs_t, stride_hs_h,
+    stride_w13_o, stride_w13_h,
+    stride_w2_h, stride_w2_i,
+    stride_out_t, stride_out_h,
+    # Compile-time constants
+    NUM_H_BLOCKS: tl.constexpr,
+    NUM_G1_BLOCKS: tl.constexpr,
+    NUM_I_BLOCKS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < Tk
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < H
+
+    tok_idx = tl.load(tok_idx_ptr + offs_m, mask=mask_m, other=0).to(tl.int32)
+    w_tok = tl.load(w_tok_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+
+    out_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for ib in range(0, NUM_I_BLOCKS):
+        u1 = tl.zeros((BLOCK_M, BLOCK_I), dtype=tl.float32)
+        u2 = tl.zeros((BLOCK_M, BLOCK_I), dtype=tl.float32)
+
+        i1_offs = ib * BLOCK_I + tl.arange(0, BLOCK_I)
+        i2_offs = I + ib * BLOCK_I + tl.arange(0, BLOCK_I)
+
+        for kb in range(0, NUM_H_BLOCKS):
+            k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+            mask_k = k_offs < H
+
+            # Load A tile [BLOCK_M, BLOCK_K] - already dequantized
+            a_ptrs = hs_ptr + (tok_idx[:, None] * stride_hs_t) + (k_offs[None, :] * stride_hs_h)
+            a = tl.load(a_ptrs, mask=(mask_m[:, None] & mask_k[None, :]), other=0.0).to(tl.float32)
+
+            # Load W13_1 tile [BLOCK_I, BLOCK_K]
+            w13_1_ptrs = w13_ptr + (i1_offs[:, None] * stride_w13_o) + (k_offs[None, :] * stride_w13_h)
+            w13_1 = tl.load(w13_1_ptrs, mask=(mask_k[None, :]), other=0.0).to(tl.float32)
+
+            # Load W13_2 tile [BLOCK_I, BLOCK_K]
+            w13_2_ptrs = w13_ptr + (i2_offs[:, None] * stride_w13_o) + (k_offs[None, :] * stride_w13_h)
+            w13_2 = tl.load(w13_2_ptrs, mask=(mask_k[None, :]), other=0.0).to(tl.float32)
+
+            u1 += tl.dot(a, tl.trans(w13_1))
+            u2 += tl.dot(a, tl.trans(w13_2))
+
+        # SwiGLU
+        silu_u2 = u2 / (1.0 + tl.exp(-u2))
+        c_blk = silu_u2 * u1
+
+        # Load W2 tile [BLOCK_N, BLOCK_I]
+        w2_ptrs = w2_ptr + (offs_n[:, None] * stride_w2_h) + (i1_offs[None, :] * stride_w2_i)
+        w2 = tl.load(w2_ptrs, mask=(mask_n[:, None]), other=0.0).to(tl.float32)
+
+        out_acc += tl.dot(c_blk, tl.trans(w2))
+
+    out_acc = out_acc * w_tok[:, None]
+
+    out_ptrs = out_ptr + (tok_idx[:, None] * stride_out_t) + (offs_n[None, :] * stride_out_h)
+    out_prev = tl.load(out_ptrs, mask=(mask_m[:, None] & mask_n[None, :]), other=0.0)
+    out_new = out_prev + out_acc
+    tl.store(out_ptrs, out_new, mask=(mask_m[:, None] & mask_n[None, :]))
+
+
+# ============================================================
+# FP8 kernel for Hopper/Blackwell (B200, H100)
+# ============================================================
 @triton.jit
 def _moe_le_fused_kernel(
     # Hidden states and scales
@@ -172,6 +269,7 @@ def run(
     gemm2_weights_scale: torch.Tensor,
     local_expert_offset: int,
     routed_scaling_factor: float,
+    output: torch.Tensor,  # DPS: pre-allocated [seq_len, hidden_size], bfloat16
 ):
     # Constants per spec
     H = 7168
@@ -250,17 +348,50 @@ def run(
     out_accum = torch.zeros((T, H), dtype=torch.float32, device=device)
 
     # 3) Launch fused per-local-expert kernels
-    # Tuned for B200: 64x128x128 tiles, 8 warps
+    use_fp8 = _gpu_supports_fp8()
+    if not use_fp8:
+        print("[INFO] GPU does not support FP8 (SM < 89). Using bf16 fallback kernel.")
+
     BLOCK_M = 64
     BLOCK_N = 128
     BLOCK_K = 128
     BLOCK_I = 128
 
+    # Pre-dequantize for A100 fallback path
+    if not use_fp8:
+        # Dequantize hidden_states: fp8 * per-block-scale -> bf16
+        # hidden_states [T, H], hidden_states_scale [NUM_H_BLOCKS, T]
+        hs_deq = hidden_states_cu.to(torch.float32).reshape(T, NUM_H_BLOCKS, BLOCK)
+        hs_scale_expand = hidden_states_scale_cu.T.unsqueeze(2)  # [T, NUM_H_BLOCKS, 1]
+        hs_deq = (hs_deq * hs_scale_expand).reshape(T, H).to(torch.bfloat16).contiguous()
+
+        # Dequantize gemm1_weights per expert: [E_local, 2I, H] fp8, scale [E_local, 32, 56]
+        w13_deq_list = []
+        for le in range(E_local):
+            w = gemm1_weights_cu[le].to(torch.float32).reshape(NUM_G1_BLOCKS, BLOCK, NUM_H_BLOCKS, BLOCK)
+            s = gemm1_weights_scale_cu[le]  # [32, 56]
+            w = w * s[:, None, :, None]
+            w13_deq_list.append(w.reshape(2 * I, H).to(torch.bfloat16))
+        w13_deq_all = torch.stack(w13_deq_list)  # [E_local, 2I, H]
+
+        # Dequantize gemm2_weights per expert: [E_local, H, I] fp8, scale [E_local, 56, 16]
+        w2_deq_list = []
+        for le in range(E_local):
+            w = gemm2_weights_cu[le].to(torch.float32).reshape(NUM_H_BLOCKS, BLOCK, NUM_I_BLOCKS, BLOCK)
+            s = gemm2_weights_scale_cu[le]  # [56, 16]
+            w = w * s[:, None, :, None]
+            w2_deq_list.append(w.reshape(H, I).to(torch.bfloat16))
+        w2_deq_all = torch.stack(w2_deq_list)  # [E_local, H, I]
+
     # Strides (in elements)
-    stride_hs_t = hidden_states_cu.stride(0)
-    stride_hs_h = hidden_states_cu.stride(1)
-    stride_hs_scale_hb = hidden_states_scale_cu.stride(0)
-    stride_hs_scale_t = hidden_states_scale_cu.stride(1)
+    if use_fp8:
+        stride_hs_t = hidden_states_cu.stride(0)
+        stride_hs_h = hidden_states_cu.stride(1)
+        stride_hs_scale_hb = hidden_states_scale_cu.stride(0)
+        stride_hs_scale_t = hidden_states_scale_cu.stride(1)
+    else:
+        stride_hs_t = hs_deq.stride(0)
+        stride_hs_h = hs_deq.stride(1)
 
     local_start = int(local_expert_offset)
     for le in range(E_local):
@@ -279,59 +410,64 @@ def run(
         # Per-token routing weights for this expert
         w_tok = weights.index_select(0, tok_idx.to(torch.int64))[:, ge].to(torch.float32).contiguous()
 
-        # Expert slices
-        w13_e = gemm1_weights_cu[le]                     # [2I, H], fp8
-        s13_e = gemm1_weights_scale_cu[le]               # [32, 56], fp32
-        w2_e = gemm2_weights_cu[le]                      # [H, I], fp8
-        s2_e = gemm2_weights_scale_cu[le]                # [56, 16], fp32
-
-        # Strides for expert tensors (in elements)
-        stride_w13_o = w13_e.stride(0)
-        stride_w13_h = w13_e.stride(1)
-        stride_s13_o = s13_e.stride(0)
-        stride_s13_hb = s13_e.stride(1)
-        stride_w2_h = w2_e.stride(0)
-        stride_w2_i = w2_e.stride(1)
-        stride_s2_hb = s2_e.stride(0)
-        stride_s2_ib = s2_e.stride(1)
-        stride_out_t = out_accum.stride(0)
-        stride_out_h = out_accum.stride(1)
-
         # Grid: tokens and H tiles
         grid_m = (Tk_local + BLOCK_M - 1) // BLOCK_M
         grid_n = (H + BLOCK_N - 1) // BLOCK_N
         if grid_m == 0 or grid_n == 0:
             continue
 
-        _moe_le_fused_kernel[(grid_m, grid_n)](
-            # Pointers
-            hidden_states_cu, hidden_states_scale_cu,
-            T, H, I,
-            tok_idx, Tk_local,
-            w13_e, s13_e,
-            w2_e, s2_e,
-            w_tok,
-            out_accum,
-            # Strides
-            stride_hs_t, stride_hs_h,
-            stride_hs_scale_hb, stride_hs_scale_t,
-            stride_w13_o, stride_w13_h,
-            stride_s13_o, stride_s13_hb,
-            stride_w2_h, stride_w2_i,
-            stride_s2_hb, stride_s2_ib,
-            stride_out_t, stride_out_h,
-            # Consts
-            NUM_H_BLOCKS, NUM_G1_BLOCKS, NUM_I_BLOCKS,
-            BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_I,
-            num_warps=8,
-            num_stages=3
-        )
+        stride_out_t = out_accum.stride(0)
+        stride_out_h = out_accum.stride(1)
 
-    # 4) Convert to BF16 for output
-    out_bf16 = out_accum.to(torch.bfloat16)
+        if use_fp8:
+            # FP8 path (B200 / H100)
+            w13_e = gemm1_weights_cu[le]
+            s13_e = gemm1_weights_scale_cu[le]
+            w2_e = gemm2_weights_cu[le]
+            s2_e = gemm2_weights_scale_cu[le]
 
-    # Move back to original device if needed
-    if orig_device.type != 'cuda':
-        out_bf16 = out_bf16.cpu()
+            _moe_le_fused_kernel[(grid_m, grid_n)](
+                hidden_states_cu, hidden_states_scale_cu,
+                T, H, I,
+                tok_idx, Tk_local,
+                w13_e, s13_e,
+                w2_e, s2_e,
+                w_tok,
+                out_accum,
+                stride_hs_t, stride_hs_h,
+                stride_hs_scale_hb, stride_hs_scale_t,
+                w13_e.stride(0), w13_e.stride(1),
+                s13_e.stride(0), s13_e.stride(1),
+                w2_e.stride(0), w2_e.stride(1),
+                s2_e.stride(0), s2_e.stride(1),
+                stride_out_t, stride_out_h,
+                NUM_H_BLOCKS, NUM_G1_BLOCKS, NUM_I_BLOCKS,
+                BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_I,
+                num_warps=8,
+                num_stages=3,
+            )
+        else:
+            # BF16 fallback path (A100)
+            w13_e = w13_deq_all[le]
+            w2_e = w2_deq_all[le]
 
-    return out_bf16
+            _moe_le_fused_kernel_bf16[(grid_m, grid_n)](
+                hs_deq,
+                T, H, I,
+                tok_idx, Tk_local,
+                w13_e,
+                w2_e,
+                w_tok,
+                out_accum,
+                stride_hs_t, stride_hs_h,
+                w13_e.stride(0), w13_e.stride(1),
+                w2_e.stride(0), w2_e.stride(1),
+                stride_out_t, stride_out_h,
+                NUM_H_BLOCKS, NUM_G1_BLOCKS, NUM_I_BLOCKS,
+                BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_I,
+                num_warps=8,
+                num_stages=3,
+            )
+
+    # 4) Write result in-place to DPS output tensor
+    output.copy_(out_accum.to(torch.bfloat16))
