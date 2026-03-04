@@ -22,6 +22,12 @@ Create high-performance GPU kernels for state-of-the-art LLM architectures on NV
 
 [FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is our official framework to evaluate your AI-generated kernels.
 
+## QUICKEST START
+> Untested. If you want to run benchmarks on a cloud platform like vast.ai without setting up a virtual environment, you can use the provided `setup-no-ve.sh` script to install dependencies and download the dataset directly.
+```shell
+bash setup-no-ve.sh
+```
+
 ## Competition Tracks
 
 The competition features three tracks, each targeting a critical LLM operation:
