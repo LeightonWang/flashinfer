@@ -1,26 +1,6 @@
 # [FlashInfer AI Kernel Generation Contest @ MLSys 2026](http://mlsys26.flashinfer.ai/)
 
-> Some of the original content of this README is not applicable. So I made some edits to make it work.
-
-Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
-
----
-
-<p align="center">
-  <a href="https://www.nvidia.com"><img src="images/nvidia-logo.svg" alt="NVIDIA" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://modal.com"><img src="images/modal-logo.png" alt="Modal" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://mlsys.org"><img src="images/mlsys-logo.svg" alt="MLSys" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer"><img src="images/flashinfer-logo.png" alt="FlashInfer" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer-bench"><img src="images/fib_logo.png" alt="FlashInfer-Bench" height="50"/></a>
-</p>
-
----
-
-[FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is our official framework to evaluate your AI-generated kernels.
+[FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is the official framework to evaluate your AI-generated kernels.
 
 ## QUICKEST START
 > Untested. If you want to run benchmarks on a cloud platform like vast.ai without setting up a virtual environment, you can use the provided `setup-no-ve.sh` script to install dependencies and download the dataset directly.
@@ -28,7 +8,13 @@ Create high-performance GPU kernels for state-of-the-art LLM architectures on NV
 bash setup-no-ve.sh
 ```
 
-## Competition Tracks
+## Agent Skills
+Triton skills is available for github copilot. Install the repositories for reference by running
+```shell
+bash .github/skills/triton-skills/install.sh
+```
+
+<!-- ## Competition Tracks
 
 The competition features three tracks, each targeting a critical LLM operation:
 
@@ -36,9 +22,8 @@ The competition features three tracks, each targeting a critical LLM operation:
 |-------|-------------|
 | **fused_moe** | Fused Mixture-of-Experts kernel for efficient expert routing and computation |
 | **sparse_attention** | Sparse attention mechanisms for long-context inference |
-| **gated_delta_net** | Gated delta network operations for efficient state updates |
+| **gated_delta_net** | Gated delta network operations for efficient state updates | -->
 
-**Fork this template once per track** you want to compete in (separate repos for each track).
 
 ## Getting Started
 
@@ -85,7 +70,7 @@ author = "team-name"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+entry_point = "kernel.py::run"            # Kernel function name
 ```
 
 ### 5. Implement Your Kernel
