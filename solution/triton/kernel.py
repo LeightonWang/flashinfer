@@ -172,6 +172,7 @@ def run(
     gemm2_weights_scale: torch.Tensor,
     local_expert_offset: int,
     routed_scaling_factor: float,
+    output: torch.Tensor
 ):
     # Constants per spec
     H = 7168
@@ -334,4 +335,5 @@ def run(
     if orig_device.type != 'cuda':
         out_bf16 = out_bf16.cpu()
 
-    return out_bf16
+    # return out_bf16
+    out_bf16.copy_(output)
