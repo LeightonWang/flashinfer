@@ -1,7 +1,7 @@
 [solution]
-name = "vllm-solution"      # Solution name
+name = "baseline"      # Solution name
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "vllm"              # Team/author name
+author = "flashinfer-ai"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
