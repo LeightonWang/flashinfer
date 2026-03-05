@@ -2,27 +2,9 @@
 
 > Some of the original content of this README is not applicable. So I made some edits to make it work.
 
-Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
-
----
-
-<p align="center">
-  <a href="https://www.nvidia.com"><img src="images/nvidia-logo.svg" alt="NVIDIA" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://modal.com"><img src="images/modal-logo.png" alt="Modal" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://mlsys.org"><img src="images/mlsys-logo.svg" alt="MLSys" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer"><img src="images/flashinfer-logo.png" alt="FlashInfer" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer-bench"><img src="images/fib_logo.png" alt="FlashInfer-Bench" height="50"/></a>
-</p>
-
----
-
 [FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is our official framework to evaluate your AI-generated kernels.
 
-## Competition Tracks
+<!-- ## Competition Tracks
 
 The competition features three tracks, each targeting a critical LLM operation:
 
@@ -32,7 +14,7 @@ The competition features three tracks, each targeting a critical LLM operation:
 | **sparse_attention** | Sparse attention mechanisms for long-context inference |
 | **gated_delta_net** | Gated delta network operations for efficient state updates |
 
-**Fork this template once per track** you want to compete in (separate repos for each track).
+**Fork this template once per track** you want to compete in (separate repos for each track). -->
 
 ## Getting Started
 
@@ -64,7 +46,7 @@ git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
 Set the environment variable:
 
 ```bash
-export FIB_DATASET_PATH=/path/to/flashinfer-trace
+export FIB_DATASET_PATH=/path/to/mlsys26-contest
 ```
 
 ### 4. Configure Your Solution
@@ -74,12 +56,12 @@ Edit `config.toml` to set your track and team info:
 ```toml
 [solution]
 name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
+definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "team-name"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+entry_point = "kernel.py::run"            # Kernel function name
 ```
 
 ### 5. Implement Your Kernel
@@ -110,7 +92,7 @@ python scripts/run_local.py
 
 Requires: Local CUDA-capable GPU and `FIB_DATASET_PATH` environment variable.
 
-### Run Cloud Benchmarks (Modal)
+### Run Benchmarks on Modal (RECOMMENDED)
 
 Test your solution on NVIDIA B200 GPUs via Modal:
 
@@ -119,14 +101,23 @@ Test your solution on NVIDIA B200 GPUs via Modal:
 ```bash
 modal setup
 modal volume create flashinfer-trace
-modal volume put flashinfer-trace /path/to/flashinfer-trace
+modal volume put flashinfer-trace /path/to/mlsys26-contest
 ```
 
 **Run benchmark:**
 
 ```bash
-modal run scripts/run_modal.py
+modal run scripts/run_modal.py [Options]
 ```
+Options:
+- `--max-workloads`: Run on a subset of workloads for quick testing (default: all workloads)
+
+for example, to run on the first 3 workloads:
+
+```bash
+modal run scripts/run_modal.py --max-workloads 3
+```
+
 
 ## Submission
 

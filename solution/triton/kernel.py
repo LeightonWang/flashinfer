@@ -336,4 +336,4 @@ def run(
         out_bf16 = out_bf16.cpu()
 
     # return out_bf16
-    out_bf16.copy_(output)
+    output.copy_(out_bf16)
