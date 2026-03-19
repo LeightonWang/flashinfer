@@ -4,131 +4,191 @@ import triton.language as tl
 
 
 # ============================================================================
-# Per-expert GEMM kernel for FP8 block-scale MoE
-# Computes: C[m,n] = sum_k (A_fp8[m,k] * B_fp8[n,k]) * sA[m,kb] * sB[nb,kb]
+# Persistent Grouped GEMM1 kernel: FP8 A × FP8 B with block-scale dequant
+# All experts in a single kernel launch with persistent CTA work scheduling.
 #
-# A = permuted hidden_states for this expert [Tk, K], fp8
-# A_scale = [num_k_blocks, total_tokens], fp32 (indexed by global permuted position)
-# B = expert weight [N, K], fp8
-# B_scale = [num_n_blocks, num_k_blocks], fp32
-# C = output for this expert [Tk, N], fp32
+# Token data is permuted and contiguous per expert via expert_offsets.
+# B weights are [E_local, N, K] contiguous (one expert = one slice).
+# B scales are [E_local, num_n_blocks, num_k_blocks].
+#
+# Tile mapping: global tile_id -> (expert_id, m_tile, n_tile) via
+# a prefix-sum table (tile_offsets) computed on host.
 # ============================================================================
 @triton.jit
-def _gemm_fp8_blockscale_kernel(
-    A_ptr,              # fp8, base pointer for this expert's input
-    A_scale_ptr,        # fp32, [num_k_blocks, total_tokens]
-    B_ptr,              # fp8, [N, K] for this expert
-    B_scale_ptr,        # fp32, [num_n_blocks, num_k_blocks]
-    C_ptr,              # fp32, base pointer for this expert's output
-    expert_offset,      # int: starting row in the permuted array for this expert
-    Tk,                 # number of tokens for this expert
+def _persistent_gemm1_kernel(
+    # A (permuted input): [total_tokens, K], fp8
+    A_ptr,
+    # A scale: [num_k_blocks, total_tokens], fp32
+    A_scale_ptr,
+    # B weights: [E_local, N, K], fp8 — contiguous per expert
+    B_ptr,
+    # B scale: [E_local, num_n_blocks, num_k_blocks], fp32
+    B_scale_ptr,
+    # C output: [total_tokens, N], fp32
+    C_ptr,
+    # Expert scheduling arrays (device tensors)
+    expert_offsets_ptr,   # [E_local + 1], int32 — cumsum of token counts
+    tile_offsets_ptr,     # [E_local + 1], int32 — cumsum of tile counts per expert
+    num_tiles,            # total number of tiles across all experts
+    # Dimensions
     K: tl.constexpr,
     N: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
+    E_LOCAL: tl.constexpr,
     # Strides
     stride_a_t, stride_a_k,
     stride_as_kb, stride_as_t,
-    stride_b_n, stride_b_k,
-    stride_bs_nb, stride_bs_kb,
+    stride_b_e, stride_b_n, stride_b_k,
+    stride_bs_e, stride_bs_nb, stride_bs_kb,
     stride_c_t, stride_c_n,
     # Tile sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    start_pid = tl.program_id(0)
 
-    # Row/col offsets
-    offs_m = expert_offset + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        # Binary search to find which expert this tile belongs to
+        # tile_offsets[e] <= tile_id < tile_offsets[e+1]
+        lo = 0
+        hi = E_LOCAL
+        while lo < hi:
+            mid = (lo + hi) // 2
+            mid_val = tl.load(tile_offsets_ptr + mid + 1)
+            if tile_id < mid_val:
+                hi = mid
+            else:
+                lo = mid + 1
+        expert_id = lo
 
-    nb = pid_n  # N-block index
+        # Tile within this expert
+        expert_tile_start = tl.load(tile_offsets_ptr + expert_id)
+        tile_in_expert = tile_id - expert_tile_start
 
-    # Accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # Expert's token range
+        e_tok_start = tl.load(expert_offsets_ptr + expert_id)
+        e_tok_end = tl.load(expert_offsets_ptr + expert_id + 1)
+        Tk = e_tok_end - e_tok_start
 
-    for kb in range(NUM_K_BLOCKS):
-        offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        # Map tile_in_expert -> (m_tile, n_tile)
+        num_n_tiles = N // BLOCK_N
+        pid_m = tile_in_expert // num_n_tiles
+        pid_n = tile_in_expert % num_n_tiles
 
-        # Load A tile: [BLOCK_M, BLOCK_K], fp8 -> dequant to fp32
-        a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
-        a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
+        # Row/col offsets in the global permuted array
+        offs_m = e_tok_start + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
+        nb = pid_n
 
-        # Load and apply A scale: per-token per-K-block
-        sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
-        a = a * sa[:, None]
+        # Accumulator
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # Load B tile: [BLOCK_N, BLOCK_K], fp8 -> dequant to fp32
-        b_ptrs = B_ptr + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
-        b = tl.load(b_ptrs).to(tl.float32)
+        for kb in range(NUM_K_BLOCKS):
+            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-        # Load and apply B scale: per-N-block per-K-block (one scalar)
-        sb = tl.load(B_scale_ptr + nb * stride_bs_nb + kb * stride_bs_kb)
-        b = b * sb
+            # Load A tile: fp8 -> fp32
+            a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
+            a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
 
-        # GEMM: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
-        acc += tl.dot(a, tl.trans(b))
+            # A scale: per-token per-K-block
+            sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
+            a = a * sa[:, None]
 
-    # Store
-    c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
-    tl.store(c_ptrs, acc, mask=mask_m[:, None])
+            # Load B tile: fp8 -> fp32, for this expert
+            b_ptrs = B_ptr + expert_id * stride_b_e + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
+            b = tl.load(b_ptrs).to(tl.float32)
+
+            # B scale
+            sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
+            b = b * sb
+
+            acc += tl.dot(a, tl.trans(b))
+
+        # Store
+        c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
+        tl.store(c_ptrs, acc, mask=mask_m[:, None])
 
 
 # ============================================================================
-# Per-expert GEMM2 kernel: fp32 A × fp8 B with block-scale dequant
-# C[m,n] = sum_k A_fp32[m,k] * (B_fp8[n,k] * sB[nb,kb])
+# Persistent Grouped GEMM2 kernel: fp32 A × fp8 B with block-scale dequant
+# Same persistent scheduling as GEMM1.
 # ============================================================================
-@triton.jit 
-def _gemm2_fp32a_fp8b_kernel(
-    A_ptr,              # fp32, base pointer
-    B_ptr,              # fp8, [N, K]
-    B_scale_ptr,        # fp32, [num_n_blocks, num_k_blocks]
-    C_ptr,              # fp32, base pointer
-    expert_offset,
-    Tk,
+@triton.jit
+def _persistent_gemm2_kernel(
+    A_ptr,                # fp32, [total_tokens, K]
+    B_ptr,                # fp8, [E_local, N, K]
+    B_scale_ptr,          # fp32, [E_local, num_n_blocks, num_k_blocks]
+    C_ptr,                # fp32, [total_tokens, N]
+    expert_offsets_ptr,
+    tile_offsets_ptr,
+    num_tiles,
     K: tl.constexpr,
     N: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
+    E_LOCAL: tl.constexpr,
     stride_a_t, stride_a_k,
-    stride_b_n, stride_b_k,
-    stride_bs_nb, stride_bs_kb,
+    stride_b_e, stride_b_n, stride_b_k,
+    stride_bs_e, stride_bs_nb, stride_bs_kb,
     stride_c_t, stride_c_n,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    start_pid = tl.program_id(0)
 
-    offs_m = expert_offset + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
-    nb = pid_n
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        # Binary search for expert
+        lo = 0
+        hi = E_LOCAL
+        while lo < hi:
+            mid = (lo + hi) // 2
+            mid_val = tl.load(tile_offsets_ptr + mid + 1)
+            if tile_id < mid_val:
+                hi = mid
+            else:
+                lo = mid + 1
+        expert_id = lo
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        expert_tile_start = tl.load(tile_offsets_ptr + expert_id)
+        tile_in_expert = tile_id - expert_tile_start
 
-    for kb in range(NUM_K_BLOCKS):
-        offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        e_tok_start = tl.load(expert_offsets_ptr + expert_id)
+        e_tok_end = tl.load(expert_offsets_ptr + expert_id + 1)
+        Tk = e_tok_end - e_tok_start
 
-        # Load A tile: [BLOCK_M, BLOCK_K], fp32
-        a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
-        a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+        num_n_tiles = N // BLOCK_N
+        pid_m = tile_in_expert // num_n_tiles
+        pid_n = tile_in_expert % num_n_tiles
 
-        # Load B tile: [BLOCK_N, BLOCK_K], fp8 -> dequant
-        b_ptrs = B_ptr + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
-        b = tl.load(b_ptrs).to(tl.float32)
+        offs_m = e_tok_start + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
+        nb = pid_n
 
-        # Apply B scale
-        sb = tl.load(B_scale_ptr + nb * stride_bs_nb + kb * stride_bs_kb)
-        b = b * sb
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # GEMM
-        acc += tl.dot(a, tl.trans(b))
+        for kb in range(NUM_K_BLOCKS):
+            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-    c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
-    tl.store(c_ptrs, acc, mask=mask_m[:, None])
+            # A: fp32
+            a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
+            a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+
+            # B: fp8 -> fp32
+            b_ptrs = B_ptr + expert_id * stride_b_e + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
+            b = tl.load(b_ptrs).to(tl.float32)
+
+            sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
+            b = b * sb
+
+            acc += tl.dot(a, tl.trans(b))
+
+        c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
+        tl.store(c_ptrs, acc, mask=mask_m[:, None])
 
 
 # ============================================================================
@@ -206,6 +266,17 @@ def _weighted_scatter_add_kernel(
     tl.atomic_add(dst_ptrs, vals, mask=mask_t[:, None])
 
 
+def _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles, device):
+    """Compute prefix-sum of tile counts per expert for persistent scheduling."""
+    E_local = expert_counts.numel()
+    # Number of M-tiles per expert = ceil(Tk_e / BLOCK_M)
+    m_tiles = (expert_counts + BLOCK_M - 1) // BLOCK_M
+    tiles_per_expert = m_tiles * num_n_tiles
+    tile_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
+    tile_offsets[1:] = torch.cumsum(tiles_per_expert, dim=0)
+    return tile_offsets
+
+
 @torch.no_grad()
 def run(
     routing_logits: torch.Tensor,
@@ -235,6 +306,7 @@ def run(
 
     T = int(routing_logits.shape[0])
     device = hidden_states.device
+    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
 
     # ========================================================================
     # Phase 1: Routing (DeepSeek-V3 no-aux) — PyTorch on CUDA
@@ -269,22 +341,13 @@ def run(
     # ========================================================================
     local_start = int(local_expert_offset)
 
-    # For each token-expert pair, build permutation arrays
-    # topk_idx: [T, TOP_K] — which experts each token selected
-    # We need to find which of those fall into local expert range [local_start, local_start+E_local)
     local_expert_mask = (topk_idx >= local_start) & (topk_idx < local_start + E_local)
-
-    # Get (token_id, expert_id) pairs for local experts
-    # token_indices_expanded[i,j] = i (token index)
     token_indices_expanded = torch.arange(T, device=device, dtype=torch.int32).unsqueeze(1).expand(T, TOP_K)
 
-    # Filter to local experts only
-    local_pairs_mask = local_expert_mask  # [T, TOP_K]
-    flat_token_ids = token_indices_expanded[local_pairs_mask]  # [num_pairs]
-    flat_expert_global = topk_idx[local_pairs_mask]            # [num_pairs]
-    flat_expert_local = flat_expert_global - local_start       # [num_pairs], in [0, E_local)
+    flat_token_ids = token_indices_expanded[local_expert_mask]
+    flat_expert_global = topk_idx[local_expert_mask]
+    flat_expert_local = flat_expert_global - local_start
 
-    # Get routing weights for these pairs
     flat_routing_weights = weights[flat_token_ids.long(), flat_expert_global.long()].to(torch.float32)
 
     total_tokens = flat_token_ids.numel()
@@ -293,27 +356,22 @@ def run(
         output.zero_()
         return
 
-    # Sort by local expert id to group tokens by expert
     sorted_order = torch.argsort(flat_expert_local.to(torch.int64), stable=True)
-    sorted_token_ids = flat_token_ids[sorted_order].to(torch.int32).contiguous()       # [total_tokens]
-    sorted_expert_local = flat_expert_local[sorted_order].to(torch.int64).contiguous() # [total_tokens]
-    sorted_weights = flat_routing_weights[sorted_order].contiguous()   # [total_tokens]
+    sorted_token_ids = flat_token_ids[sorted_order].to(torch.int32).contiguous()
+    sorted_expert_local = flat_expert_local[sorted_order].to(torch.int64).contiguous()
+    sorted_weights = flat_routing_weights[sorted_order].contiguous()
 
-    # Compute expert_offsets: cumulative count of tokens per expert
-    # expert_offsets[e] = start index, expert_offsets[e+1] = end index
-    expert_counts = torch.bincount(sorted_expert_local.to(torch.int64), minlength=E_local).to(torch.int32)
+    expert_counts = torch.bincount(sorted_expert_local, minlength=E_local).to(torch.int32)
     expert_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
     expert_offsets[1:] = torch.cumsum(expert_counts, dim=0)
 
-    # Permute input: gather rows of hidden_states according to sorted_token_ids
-    # permuted_input[i] = hidden_states[sorted_token_ids[i]]
-    permuted_input = hidden_states.index_select(0, sorted_token_ids.long()).contiguous()  # [total_tokens, H], fp8
-    # Permute hidden_states_scale: scale is [NUM_H_BLOCKS, T], we need [NUM_H_BLOCKS, total_tokens]
-    permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids.long()).contiguous()  # [56, total_tokens], fp32
+    permuted_input = hidden_states.index_select(0, sorted_token_ids.long()).contiguous()
+    permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids.long()).contiguous()
 
     # ========================================================================
-    # Phase 3: Grouped GEMM1 — [total_tokens, H] x [2I, H]^T -> [total_tokens, 2I]
-    # Per-expert kernel launches (simpler, avoids complex persistent kernel)
+    # Phase 3: Persistent Grouped GEMM1
+    # [total_tokens, H] x [E_local, 2*I, H]^T -> [total_tokens, 2*I]
+    # Single kernel launch for all experts
     # ========================================================================
     gemm1_out = torch.empty((total_tokens, 2 * I), dtype=torch.float32, device=device)
 
@@ -321,29 +379,28 @@ def run(
     BLOCK_N = 128
     BLOCK_K = 128
 
-    for e in range(E_local):
-        tk_e = int(expert_counts[e].item())
-        if tk_e == 0:
-            continue
-        e_offset = int(expert_offsets[e].item())
+    num_n_tiles_g1 = (2 * I) // BLOCK_N  # 32
+    tile_offsets_g1 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g1, device)
+    total_tiles_g1 = int(tile_offsets_g1[-1].item())
 
-        grid = (
-            (tk_e + BLOCK_M - 1) // BLOCK_M,
-            (2 * I) // BLOCK_N,  # 32
-        )
-        _gemm_fp8_blockscale_kernel[grid](
+    if total_tiles_g1 > 0:
+        grid_g1 = (min(NUM_SMS, total_tiles_g1),)
+        _persistent_gemm1_kernel[grid_g1](
             permuted_input, permuted_hs_scale,
-            gemm1_weights[e], gemm1_weights_scale[e],
+            gemm1_weights, gemm1_weights_scale,
             gemm1_out,
-            e_offset, tk_e,
+            expert_offsets, tile_offsets_g1,
+            total_tiles_g1,
             K=H, N=2 * I,
             NUM_K_BLOCKS=NUM_H_BLOCKS,
+            E_LOCAL=E_local,
             stride_a_t=permuted_input.stride(0), stride_a_k=permuted_input.stride(1),
             stride_as_kb=permuted_hs_scale.stride(0), stride_as_t=permuted_hs_scale.stride(1),
-            stride_b_n=gemm1_weights[e].stride(0), stride_b_k=gemm1_weights[e].stride(1),
-            stride_bs_nb=gemm1_weights_scale[e].stride(0), stride_bs_kb=gemm1_weights_scale[e].stride(1),
+            stride_b_e=gemm1_weights.stride(0), stride_b_n=gemm1_weights.stride(1), stride_b_k=gemm1_weights.stride(2),
+            stride_bs_e=gemm1_weights_scale.stride(0), stride_bs_nb=gemm1_weights_scale.stride(1), stride_bs_kb=gemm1_weights_scale.stride(2),
             stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            NUM_SMS=NUM_SMS,
             num_warps=8, num_stages=3,
         )
 
@@ -365,33 +422,33 @@ def run(
     )
 
     # ========================================================================
-    # Phase 5: Grouped GEMM2 — [total_tokens, I] x [H, I]^T -> [total_tokens, H]
-    # A = swiglu_out (fp32), B = gemm2_weights (fp8) — no re-quantization
+    # Phase 5: Persistent Grouped GEMM2
+    # [total_tokens, I] x [E_local, H, I]^T -> [total_tokens, H]
+    # Single kernel launch for all experts
     # ========================================================================
     gemm2_out = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
 
-    for e in range(E_local):
-        tk_e = int(expert_counts[e].item())
-        if tk_e == 0:
-            continue
-        e_offset = int(expert_offsets[e].item())
+    num_n_tiles_g2 = H // BLOCK_N  # 56
+    tile_offsets_g2 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g2, device)
+    total_tiles_g2 = int(tile_offsets_g2[-1].item())
 
-        grid = (
-            (tk_e + BLOCK_M - 1) // BLOCK_M,
-            H // BLOCK_N,  # 56
-        )
-        _gemm2_fp32a_fp8b_kernel[grid](
+    if total_tiles_g2 > 0:
+        grid_g2 = (min(NUM_SMS, total_tiles_g2),)
+        _persistent_gemm2_kernel[grid_g2](
             swiglu_out,
-            gemm2_weights[e], gemm2_weights_scale[e],
+            gemm2_weights, gemm2_weights_scale,
             gemm2_out,
-            e_offset, tk_e,
+            expert_offsets, tile_offsets_g2,
+            total_tiles_g2,
             K=I, N=H,
             NUM_K_BLOCKS=NUM_I_BLOCKS,
+            E_LOCAL=E_local,
             stride_a_t=swiglu_out.stride(0), stride_a_k=swiglu_out.stride(1),
-            stride_b_n=gemm2_weights[e].stride(0), stride_b_k=gemm2_weights[e].stride(1),
-            stride_bs_nb=gemm2_weights_scale[e].stride(0), stride_bs_kb=gemm2_weights_scale[e].stride(1),
+            stride_b_e=gemm2_weights.stride(0), stride_b_n=gemm2_weights.stride(1), stride_b_k=gemm2_weights.stride(2),
+            stride_bs_e=gemm2_weights_scale.stride(0), stride_bs_nb=gemm2_weights_scale.stride(1), stride_bs_kb=gemm2_weights_scale.stride(2),
             stride_c_t=gemm2_out.stride(0), stride_c_n=gemm2_out.stride(1),
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            NUM_SMS=NUM_SMS,
             num_warps=8, num_stages=3,
         )
 
