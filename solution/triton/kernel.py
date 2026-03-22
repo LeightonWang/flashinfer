@@ -89,23 +89,19 @@ def _persistent_gemm1_kernel(
         for kb in range(NUM_K_BLOCKS):
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-            # Load A tile: fp8 -> fp32
+            # Load A tile: [BLOCK_M, BLOCK_K], keep fp8 for tensor cores
             a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
-            a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
+            a_fp8 = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
 
-            # A scale: per-token per-K-block
-            sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
-            a = a * sa[:, None]
-
-            # Load B tile: fp8 -> fp32, for this expert
+            # Load B tile: [BLOCK_N, BLOCK_K], keep fp8 for tensor cores
             b_ptrs = B_ptr + expert_id * stride_b_e + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
-            b = tl.load(b_ptrs).to(tl.float32)
+            b_fp8 = tl.load(b_ptrs)
 
-            # B scale
+            # FP8 Tensor Core dot + post-hoc scaling
+            partial = tl.dot(a_fp8, tl.trans(b_fp8))
+            sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
             sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
-            b = b * sb
-
-            acc += tl.dot(a, tl.trans(b))
+            acc += partial * sa[:, None] * sb
 
         # Store
         c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
