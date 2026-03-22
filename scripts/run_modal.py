@@ -31,10 +31,6 @@ image = (
         add_python="3.12",
     )
     .pip_install("flashinfer-python", "flashinfer-bench", "torch", "triton", "numpy")
-    .run_commands(
-        "python -c 'from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module; get_trtllm_moe_sm100_module()'",
-        gpu="B200",
-    )
 )
 
 
