@@ -37,6 +37,7 @@ def run(
     gemm2_weights_scale: torch.Tensor,
     local_expert_offset: int,
     routed_scaling_factor: float,
+    output: torch.Tensor,
 ):
     seq_len, num_experts = routing_logits.shape
     local_num_experts = gemm1_weights.shape[0]
@@ -78,7 +79,7 @@ def run(
     if routing_bias is not None:
         routing_bias = routing_bias.contiguous()
 
-    return trtllm_fp8_block_scale_moe(
+    out_accum = trtllm_fp8_block_scale_moe(
         routing_logits_f32,
         routing_bias,
         hidden_states.contiguous(),
@@ -95,7 +96,8 @@ def run(
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
-        tile_tokens_dim=tile_tokens_dim,
         routing_method_type=2,
         use_shuffled_weight=False,
     )
+
+    output.copy_(out_accum)

@@ -26,8 +26,15 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+        add_python="3.12",
+    )
+    .pip_install("flashinfer-python", "flashinfer-bench", "torch", "triton", "numpy")
+    .run_commands(
+        "python -c 'from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module; get_trtllm_moe_sm100_module()'",
+        gpu="B200",
+    )
 )
 
 
@@ -75,6 +82,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
             entry = {
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
+                "log": trace.evaluation.log,
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
@@ -108,6 +116,9 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+
+            if result.get("log"):
+                print(f"    Log: {result['log']}")
 
 
 @app.local_entrypoint()
