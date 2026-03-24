@@ -75,6 +75,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
             entry = {
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
+                "log": trace.evaluation.log,
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
@@ -108,6 +109,9 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+
+            if result.get("log"):
+                print(f"    Log: {result['log']}")
 
 
 @app.local_entrypoint()
