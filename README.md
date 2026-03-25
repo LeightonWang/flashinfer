@@ -104,6 +104,8 @@ modal volume create flashinfer-trace
 modal volume put flashinfer-trace /path/to/mlsys26-contest
 ```
 
+Note that the path you use in `modal volume put flashinfer-trace /path/to/mlsys26-contest` should ends with `/`.
+
 **Run benchmark:**
 
 ```bash
