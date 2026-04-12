@@ -1,163 +1,494 @@
-import math
 import torch
 import triton
 import triton.language as tl
 
 
-# Fused per-expert kernel:
-# - On-the-fly FP8 block dequantization for hidden_states, W13 (gate/up), and W2 (down)
-# - GEMM1 (split into two heads) -> SwiGLU -> GEMM2
-# - Accumulate per-token with routing weights into output
+# ============================================================================
+# Persistent Grouped GEMM1 kernel: FP8 A × FP8 B with block-scale dequant
+# All experts in a single kernel launch with persistent CTA work scheduling.
+#
+# Token data is permuted and contiguous per expert via expert_offsets.
+# B weights are [E_local, N, K] contiguous (one expert = one slice).
+# B scales are [E_local, num_n_blocks, num_k_blocks].
+#
+# Tile mapping: global tile_id -> (expert_id, m_tile, n_tile) via
+# a prefix-sum table (tile_offsets) computed on host.
+# ============================================================================
 @triton.jit
-def _moe_le_fused_kernel(
-    # Hidden states and scales
-    hs_ptr: tl.pointer_type(tl.float8e4nv),         # [T, H], fp8 e4m3fn (NV)
-    hs_scale_ptr: tl.pointer_type(tl.float32),      # [H/128, T], fp32
-    T, H, I,                                        # runtime sizes
-    # Token index list for this local expert
-    tok_idx_ptr: tl.pointer_type(tl.int32),         # [Tk]
-    Tk,                                             # int32
-    # Expert weights and scales (for one local expert)
-    w13_ptr: tl.pointer_type(tl.float8e4nv),        # [2I, H], fp8
-    s13_ptr: tl.pointer_type(tl.float32),           # [num_gemm1_out_blocks(=32), num_hidden_blocks(=56)], fp32
-    w2_ptr: tl.pointer_type(tl.float8e4nv),         # [H, I], fp8
-    s2_ptr: tl.pointer_type(tl.float32),            # [num_hidden_blocks(=56), num_intermediate_blocks(=16)], fp32
-    # Routing weights for tokens of this expert
-    w_tok_ptr: tl.pointer_type(tl.float32),         # [Tk]
-    # Output (accumulating)
-    out_ptr: tl.pointer_type(tl.float32),           # [T, H]
-    # Strides (in elements)
-    stride_hs_t, stride_hs_h,
-    stride_hs_scale_hb, stride_hs_scale_t,
-    stride_w13_o, stride_w13_h,
-    stride_s13_o, stride_s13_hb,
-    stride_w2_h, stride_w2_i,
-    stride_s2_hb, stride_s2_ib,
-    stride_out_t, stride_out_h,
-    # Compile-time constants
-    NUM_H_BLOCKS: tl.constexpr,          # 56
-    NUM_G1_BLOCKS: tl.constexpr,         # 32
-    NUM_I_BLOCKS: tl.constexpr,          # 16
-    BLOCK_M: tl.constexpr,               # tokens per program
-    BLOCK_N: tl.constexpr,               # H tile (128)
-    BLOCK_K: tl.constexpr,               # K=H block (128)
-    BLOCK_I: tl.constexpr                # I block (128)
+def _persistent_gemm1_kernel(
+    # A (permuted input): [total_tokens, K], fp8
+    A_ptr,
+    # A scale: [num_k_blocks, total_tokens], fp32
+    A_scale_ptr,
+    # B weights: [E_local, N, K], fp8 — contiguous per expert
+    B_ptr,
+    # B scale: [E_local, num_n_blocks, num_k_blocks], fp32
+    B_scale_ptr,
+    # C output: [total_tokens, N], fp32
+    C_ptr,
+    # Expert scheduling arrays (device tensors)
+    expert_offsets_ptr,   # [E_local + 1], int32 — cumsum of token counts
+    tile_offsets_ptr,     # [E_local + 1], int32 — cumsum of tile counts per expert
+    num_tiles,            # total number of tiles across all experts
+    # Dimensions
+    K: tl.constexpr,
+    N: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    # Strides
+    stride_a_t, stride_a_k,
+    stride_as_kb, stride_as_t,
+    stride_b_e, stride_b_n, stride_b_k,
+    stride_bs_e, stride_bs_nb, stride_bs_kb,
+    stride_c_t, stride_c_n,
+    # Tile sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)  # token tile id
-    pid_n = tl.program_id(1)  # hidden output H tile id (also H block index when BLOCK_N=128)
+    start_pid = tl.program_id(0)
 
-    # Offsets and masks
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < Tk
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        # Binary search to find which expert this tile belongs to
+        # tile_offsets[e] <= tile_id < tile_offsets[e+1]
+        lo = 0
+        hi = E_LOCAL
+        while lo < hi:
+            mid = (lo + hi) // 2
+            mid_val = tl.load(tile_offsets_ptr + mid + 1)
+            if tile_id < mid_val:
+                hi = mid
+            else:
+                lo = mid + 1
+        expert_id = lo
 
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_n = offs_n < H
+        # Tile within this expert
+        expert_tile_start = tl.load(tile_offsets_ptr + expert_id)
+        tile_in_expert = tile_id - expert_tile_start
 
-    # Gather token indices for this tile [BLOCK_M]
-    tok_idx = tl.load(tok_idx_ptr + offs_m, mask=mask_m, other=0).to(tl.int32)
-    # Per-token routing weights [BLOCK_M]
-    w_tok = tl.load(w_tok_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+        # Expert's token range
+        e_tok_start = tl.load(expert_offsets_ptr + expert_id)
+        e_tok_end = tl.load(expert_offsets_ptr + expert_id + 1)
+        Tk = e_tok_end - e_tok_start
 
-    # Accumulator for output tile [BLOCK_M, BLOCK_N]
-    out_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # Map tile_in_expert -> (m_tile, n_tile)
+        num_n_tiles = N // BLOCK_N
+        pid_m = tile_in_expert // num_n_tiles
+        pid_n = tile_in_expert % num_n_tiles
 
-    # Hidden block index for this H tile; with BLOCK_N == 128, this equals pid_n
-    hb = pid_n
+        # Row/col offsets in the global permuted array
+        offs_m = e_tok_start + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
+        nb = pid_n
 
-    # Pre-create "other" tensors for masked loads of fp8 tiles (avoid dtype cast errors)
-    other_a_fp8 = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float8e4nv)
-    other_w13_fp8 = tl.zeros((BLOCK_I, BLOCK_K), dtype=tl.float8e4nv)
-    other_w2_fp8 = tl.zeros((BLOCK_N, BLOCK_I), dtype=tl.float8e4nv)
+        # Accumulator
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Iterate over intermediate blocks (I in blocks of 128)
-    for ib in range(0, NUM_I_BLOCKS):
-        # Accumulators for GEMM1 partials for this ib: U1 and U2 tiles [BLOCK_M, BLOCK_I]
-        u1 = tl.zeros((BLOCK_M, BLOCK_I), dtype=tl.float32)
-        u2 = tl.zeros((BLOCK_M, BLOCK_I), dtype=tl.float32)
+        for kb in range(NUM_K_BLOCKS):
+            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-        # Row indices within W13 for current ib
-        i1_offs = ib * BLOCK_I + tl.arange(0, BLOCK_I)
-        i2_offs = I + ib * BLOCK_I + tl.arange(0, BLOCK_I)
+            # Load A tile: [BLOCK_M, BLOCK_K], keep fp8 for tensor cores
+            a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
+            a_fp8 = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
 
-        # Loop over K dimension (H) in blocks of 128
-        for kb in range(0, NUM_H_BLOCKS):
-            k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-            mask_k = k_offs < H
+            # Load B tile: [BLOCK_N, BLOCK_K], keep fp8 for tensor cores
+            b_ptrs = B_ptr + expert_id * stride_b_e + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
+            b_fp8 = tl.load(b_ptrs)
 
-            # Load A tile: [BLOCK_M, BLOCK_K] from hs_ptr using gathered token rows
-            a_ptrs = hs_ptr + (tok_idx[:, None] * stride_hs_t) + (k_offs[None, :] * stride_hs_h)
-            a_fp8 = tl.load(a_ptrs, mask=(mask_m[:, None] & mask_k[None, :]), other=other_a_fp8)
-            a = a_fp8.to(tl.float32)
+            # FP8 Tensor Core dot + post-hoc scaling
+            partial = tl.dot(a_fp8, tl.trans(b_fp8))
+            sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
+            sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
+            acc += partial * sa[:, None] * sb
 
-            # Load and apply per-block scaling for A: hs_scale_ptr[kb, tok_idx]
-            sA = tl.load(
-                hs_scale_ptr + kb * stride_hs_scale_hb + tok_idx * stride_hs_scale_t,
-                mask=mask_m,
-                other=0.0
-            )
-            a = a * sA[:, None]
-
-            # Load W13_1 tile: [BLOCK_I, BLOCK_K]
-            w13_1_ptrs = w13_ptr + (i1_offs[:, None] * stride_w13_o) + (k_offs[None, :] * stride_w13_h)
-            w13_1_fp8 = tl.load(w13_1_ptrs, mask=(mask_k[None, :]), other=other_w13_fp8)
-            w13_1 = w13_1_fp8.to(tl.float32)
-            # Scale for W13_1: s13[ib, kb]
-            s13_1 = tl.load(s13_ptr + ib * stride_s13_o + kb * stride_s13_hb)
-            w13_1 = w13_1 * s13_1
-
-            # Load W13_2 tile: [BLOCK_I, BLOCK_K]
-            w13_2_ptrs = w13_ptr + (i2_offs[:, None] * stride_w13_o) + (k_offs[None, :] * stride_w13_h)
-            w13_2_fp8 = tl.load(w13_2_ptrs, mask=(mask_k[None, :]), other=other_w13_fp8)
-            w13_2 = w13_2_fp8.to(tl.float32)
-            # Scale for W13_2: s13[NUM_I_BLOCKS + ib, kb]
-            s13_2 = tl.load(s13_ptr + (NUM_I_BLOCKS + ib) * stride_s13_o + kb * stride_s13_hb)
-            w13_2 = w13_2 * s13_2
-
-            # GEMM1 partials: [BLOCK_M, BLOCK_I]
-            u1 += tl.dot(a, tl.trans(w13_1))
-            u2 += tl.dot(a, tl.trans(w13_2))
-
-        # SwiGLU on the block
-        silu_u2 = u2 / (1.0 + tl.exp(-u2))
-        c_blk = silu_u2 * u1  # [BLOCK_M, BLOCK_I]
-
-        # Load W2 tile corresponding to current H tile and ib block: [BLOCK_N, BLOCK_I]
-        w2_ptrs = w2_ptr + (offs_n[:, None] * stride_w2_h) + (i1_offs[None, :] * stride_w2_i)
-        w2_fp8 = tl.load(w2_ptrs, mask=(mask_n[:, None]), other=other_w2_fp8)
-        w2 = w2_fp8.to(tl.float32)
-        # Scale for W2: s2[hb, ib] (one scalar per [128,128] tile)
-        s2 = tl.load(s2_ptr + hb * stride_s2_hb + ib * stride_s2_ib)
-        w2 = w2 * s2
-
-        # Accumulate into output tile: [BLOCK_M, BLOCK_N] += [BLOCK_M, BLOCK_I] @ [BLOCK_I, BLOCK_N]
-        out_acc += tl.dot(c_blk, tl.trans(w2))
-
-    # Apply per-token routing weights
-    out_acc = out_acc * w_tok[:, None]
-
-    # Accumulate into global output
-    out_ptrs = out_ptr + (tok_idx[:, None] * stride_out_t) + (offs_n[None, :] * stride_out_h)
-    out_prev = tl.load(out_ptrs, mask=(mask_m[:, None] & mask_n[None, :]), other=0.0)
-    out_new = out_prev + out_acc
-    tl.store(out_ptrs, out_new, mask=(mask_m[:, None] & mask_n[None, :]))
+        # Store
+        c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
+        tl.store(c_ptrs, acc, mask=mask_m[:, None])
 
 
-def _check_cuda_and_move(t: torch.Tensor, device: torch.device) -> torch.Tensor:
-    if t.device.type == 'cuda':
-        return t
-    if device.type != 'cuda':
-        raise RuntimeError("CUDA is required to run this kernel; no CUDA device available.")
-    return t.to(device, non_blocking=True)
+# ============================================================================
+# Persistent Grouped GEMM2 kernel: fp32 A × fp8 B with block-scale dequant
+# Same persistent scheduling as GEMM1.
+# ============================================================================
+@triton.jit
+def _persistent_gemm2_kernel(
+    A_ptr,                # fp32, [total_tokens, K]
+    B_ptr,                # fp8, [E_local, N, K]
+    B_scale_ptr,          # fp32, [E_local, num_n_blocks, num_k_blocks]
+    C_ptr,                # fp32, [total_tokens, N]
+    expert_offsets_ptr,
+    tile_offsets_ptr,
+    num_tiles,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    stride_a_t, stride_a_k,
+    stride_b_e, stride_b_n, stride_b_k,
+    stride_bs_e, stride_bs_nb, stride_bs_kb,
+    stride_c_t, stride_c_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    start_pid = tl.program_id(0)
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        # Binary search for expert
+        lo = 0
+        hi = E_LOCAL
+        while lo < hi:
+            mid = (lo + hi) // 2
+            mid_val = tl.load(tile_offsets_ptr + mid + 1)
+            if tile_id < mid_val:
+                hi = mid
+            else:
+                lo = mid + 1
+        expert_id = lo
+
+        expert_tile_start = tl.load(tile_offsets_ptr + expert_id)
+        tile_in_expert = tile_id - expert_tile_start
+
+        e_tok_start = tl.load(expert_offsets_ptr + expert_id)
+        e_tok_end = tl.load(expert_offsets_ptr + expert_id + 1)
+        Tk = e_tok_end - e_tok_start
+
+        num_n_tiles = N // BLOCK_N
+        pid_m = tile_in_expert // num_n_tiles
+        pid_n = tile_in_expert % num_n_tiles
+
+        offs_m = e_tok_start + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
+        nb = pid_n
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for kb in range(NUM_K_BLOCKS):
+            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+
+            # A: fp32
+            a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
+            a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+
+            # B: fp8 -> fp32
+            b_ptrs = B_ptr + expert_id * stride_b_e + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
+            b = tl.load(b_ptrs).to(tl.float32)
+
+            sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
+            b = b * sb
+
+            acc += tl.dot(a, tl.trans(b))
+
+        c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
+        tl.store(c_ptrs, acc, mask=mask_m[:, None])
 
 
-def _ensure_cuda(*tensors):
-    # Ensure CUDA is available. If not, raise clear error.
-    if not torch.cuda.is_available():
-        for t in tensors:
-            if isinstance(t, torch.Tensor) and t.is_cuda:
-                raise RuntimeError("CUDA inputs provided but CUDA is reported unavailable.")
-        raise RuntimeError("CUDA is required to run this kernel; no CUDA device available.")
-    return torch.device('cuda')
+# ============================================================================
+# SwiGLU kernel: out[i] = silu(up[i]) * gate[i]
+# Input: [total_tokens, 2*I] (gate = [:, :I], up = [:, I:])
+# Output: [total_tokens, I]
+# ============================================================================
+@triton.jit
+def _swiglu_kernel(
+    input_ptr,
+    output_ptr,
+    total_tokens,
+    I: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_i = tl.program_id(1)
+
+    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask_t = offs_t < total_tokens
+
+    # Load gate (first half) and up (second half)
+    gate_ptrs = input_ptr + offs_t[:, None] * (2 * I) + offs_i[None, :]
+    up_ptrs = input_ptr + offs_t[:, None] * (2 * I) + (I + offs_i[None, :])
+
+    gate = tl.load(gate_ptrs, mask=mask_t[:, None], other=0.0).to(tl.float32)
+    up = tl.load(up_ptrs, mask=mask_t[:, None], other=0.0).to(tl.float32)
+
+    # SwiGLU: silu(up) * gate
+    silu_up = up * tl.sigmoid(up)
+    result = silu_up * gate
+
+    # Store
+    out_ptrs = output_ptr + offs_t[:, None] * I + offs_i[None, :]
+    tl.store(out_ptrs, result, mask=mask_t[:, None])
+
+
+# ============================================================================
+# Weighted scatter-add kernel:
+# For each permuted token at position p, add weight * value to output[original_token_id]
+# ============================================================================
+@triton.jit
+def _weighted_scatter_add_kernel(
+    src_ptr,         # [total_tokens, H], fp32
+    dst_ptr,         # [T, H], fp32 (output accumulator)
+    token_ids_ptr,   # [total_tokens], int32 - original token indices
+    weights_ptr,     # [total_tokens], fp32 - routing weights
+    total_tokens,
+    H: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_t = offs_t < total_tokens
+
+    # Load token ids and weights
+    tok_ids = tl.load(token_ids_ptr + offs_t, mask=mask_t, other=0)
+    w = tl.load(weights_ptr + offs_t, mask=mask_t, other=0.0)
+
+    # Load source values
+    src_ptrs = src_ptr + offs_t[:, None] * H + offs_h[None, :]
+    vals = tl.load(src_ptrs, mask=mask_t[:, None], other=0.0)
+
+    # Apply weights
+    vals = vals * w[:, None]
+
+    # Scatter-add to output (atomic since multiple experts may write same token)
+    dst_ptrs = dst_ptr + tok_ids[:, None] * H + offs_h[None, :]
+    tl.atomic_add(dst_ptrs, vals, mask=mask_t[:, None])
+
+
+@triton.jit
+def _route_select_local_kernel(
+    routing_logits_ptr,    # [T, E_global], fp32/fp16/bf16
+    routing_bias_ptr,      # [E_global], fp32
+    local_ids_ptr,         # [T, TOP_K], int32 (-1 means non-local)
+    local_weights_ptr,     # [T, TOP_K], fp32
+    T,
+    stride_rl_t, stride_rl_e,
+    stride_local_t, stride_local_k,
+    local_start,
+    routed_scaling_factor,
+    E_GLOBAL: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    TOP_K: tl.constexpr,
+    N_GROUP: tl.constexpr,
+    TOPK_GROUP: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= T:
+        return
+
+    neg_inf_e = tl.full((E_GLOBAL,), -float("inf"), dtype=tl.float32)
+    neg_inf_g = tl.full((N_GROUP,), -float("inf"), dtype=tl.float32)
+
+    e = tl.arange(0, E_GLOBAL)
+    groups = tl.arange(0, N_GROUP)
+    k_arange = tl.arange(0, TOP_K)
+
+    logits = tl.load(routing_logits_ptr + pid * stride_rl_t + e * stride_rl_e).to(tl.float32)
+    bias = tl.load(routing_bias_ptr + e).to(tl.float32)
+
+    s = tl.sigmoid(logits)
+    s_with_bias = s + bias
+
+    group_scores = tl.zeros((N_GROUP,), dtype=tl.float32)
+    for g in range(N_GROUP):
+        g_lo = g * GROUP_SIZE
+        in_group = (e >= g_lo) & (e < g_lo + GROUP_SIZE)
+        vals = tl.where(in_group, s_with_bias, neg_inf_e)
+        idx1 = tl.argmax(vals, axis=0)
+        vals_wo_top1 = tl.where(in_group & (e != idx1), s_with_bias, neg_inf_e)
+        max1 = tl.max(vals, axis=0)
+        max2 = tl.max(vals_wo_top1, axis=0)
+        score = (max1 + max2).to(tl.float32)
+        group_scores = tl.where(groups == g, score, group_scores)
+
+    pruned_scores = tl.full((E_GLOBAL,), -float("inf"), dtype=tl.float32)
+    selected_groups = tl.zeros((N_GROUP,), dtype=tl.int32)
+    for _ in range(TOPK_GROUP):
+        masked_group_scores = tl.where(selected_groups > 0, neg_inf_g, group_scores)
+        g_sel = tl.argmax(masked_group_scores, axis=0)
+        selected_groups = selected_groups + (groups == g_sel).to(tl.int32)
+
+        in_group = (e >= g_sel * GROUP_SIZE) & (e < (g_sel + 1) * GROUP_SIZE)
+        pruned_scores = tl.where(in_group, s_with_bias, pruned_scores)
+
+    selected_experts = tl.zeros((E_GLOBAL,), dtype=tl.int32)
+    topk_ids = tl.zeros((TOP_K,), dtype=tl.int32)
+    topk_s = tl.zeros((TOP_K,), dtype=tl.float32)
+    for k in range(TOP_K):
+        masked_scores = tl.where(selected_experts > 0, neg_inf_e, pruned_scores)
+        e_sel = tl.argmax(masked_scores, axis=0)
+        selected_experts = selected_experts + (e == e_sel).to(tl.int32)
+
+        s_sel = tl.sum(tl.where(e == e_sel, s, 0.0), axis=0)
+        topk_ids = tl.where(k_arange == k, e_sel.to(tl.int32), topk_ids)
+        topk_s = tl.where(k_arange == k, s_sel, topk_s)
+
+    denom = tl.sum(topk_s, axis=0)
+
+    local_ids = tl.full((TOP_K,), -1, dtype=tl.int32)
+    local_weights = tl.zeros((TOP_K,), dtype=tl.float32)
+    for k in range(TOP_K):
+        k_mask = k_arange == k
+        expert_id = tl.sum(tl.where(k_mask, topk_ids, 0), axis=0)
+        topk_s_k = tl.sum(tl.where(k_mask, topk_s, 0.0), axis=0)
+        is_local = (expert_id >= local_start) & (expert_id < local_start + E_LOCAL)
+        local_id = expert_id - local_start
+        w = (topk_s_k * routed_scaling_factor / (denom + 1e-20)).to(tl.float32)
+        local_ids = tl.where(k_mask & is_local, local_id.to(tl.int32), local_ids)
+        local_weights = tl.where(k_mask & is_local, w, local_weights)
+
+    out_ptr = local_ids_ptr + pid * stride_local_t + k_arange * stride_local_k
+    out_w_ptr = local_weights_ptr + pid * stride_local_t + k_arange * stride_local_k
+    tl.store(out_ptr, local_ids)
+    tl.store(out_w_ptr, local_weights)
+
+
+@triton.jit
+def _count_local_experts_kernel(
+    local_ids_ptr,         # [T, TOP_K], int32
+    expert_counts_ptr,     # [E_local], int32
+    T,
+    stride_local_t, stride_local_k,
+    TOP_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+
+    for k in range(TOP_K):
+        ids = tl.load(local_ids_ptr + offs_t * stride_local_t + k * stride_local_k, mask=mask_t, other=-1)
+        valid = ids >= 0
+        ids_safe = tl.where(valid, ids, 0)
+        tl.atomic_add(expert_counts_ptr + ids_safe, 1, mask=mask_t & valid)
+
+
+@triton.jit
+def _scatter_local_tokens_kernel(
+    local_ids_ptr,         # [T, TOP_K], int32
+    local_weights_ptr,     # [T, TOP_K], fp32
+    write_ptrs_ptr,        # [E_local], int32 (initialized from expert_offsets[:-1])
+    sorted_token_ids_ptr,  # [total_tokens], int32
+    sorted_weights_ptr,    # [total_tokens], fp32
+    T,
+    stride_local_t, stride_local_k,
+    TOP_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+
+    for k in range(TOP_K):
+        ids = tl.load(local_ids_ptr + offs_t * stride_local_t + k * stride_local_k, mask=mask_t, other=-1)
+        w = tl.load(local_weights_ptr + offs_t * stride_local_t + k * stride_local_k, mask=mask_t, other=0.0)
+
+        valid = mask_t & (ids >= 0)
+        ids_safe = tl.where(valid, ids, 0)
+
+        pos = tl.atomic_add(write_ptrs_ptr + ids_safe, 1, mask=valid)
+        tl.store(sorted_token_ids_ptr + pos, offs_t.to(tl.int32), mask=valid)
+        tl.store(sorted_weights_ptr + pos, w, mask=valid)
+
+
+def _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles, device):
+    """Compute prefix-sum of tile counts per expert for persistent scheduling."""
+    E_local = expert_counts.numel()
+    # Number of M-tiles per expert = ceil(Tk_e / BLOCK_M)
+    m_tiles = (expert_counts + BLOCK_M - 1) // BLOCK_M
+    tiles_per_expert = m_tiles * num_n_tiles
+    tile_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
+    tile_offsets[1:] = torch.cumsum(tiles_per_expert, dim=0)
+    return tile_offsets
+
+
+def _route_and_permute_local_fused(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    routed_scaling_factor: float,
+    local_expert_offset: int,
+    E_global: int,
+    E_local: int,
+    TOP_K: int,
+    N_GROUP: int,
+    TOPK_GROUP: int,
+):
+    """Triton-backed fused routing + local permutation with downstream-compatible outputs."""
+    T = int(routing_logits.shape[0])
+    device = routing_logits.device
+
+    group_size = E_global // N_GROUP
+    local_ids = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
+    local_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
+
+    grid_route = (T,)
+    _route_select_local_kernel[grid_route](
+        routing_logits,
+        routing_bias,
+        local_ids,
+        local_weights,
+        T,
+        stride_rl_t=routing_logits.stride(0), stride_rl_e=routing_logits.stride(1),
+        stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
+        local_start=int(local_expert_offset),
+        routed_scaling_factor=float(routed_scaling_factor),
+        E_GLOBAL=E_global,
+        E_LOCAL=E_local,
+        TOP_K=TOP_K,
+        N_GROUP=N_GROUP,
+        TOPK_GROUP=TOPK_GROUP,
+        GROUP_SIZE=group_size,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    expert_counts = torch.zeros((E_local,), dtype=torch.int32, device=device)
+    BLOCK_T = 128
+    grid_count = (triton.cdiv(T, BLOCK_T),)
+    _count_local_experts_kernel[grid_count](
+        local_ids,
+        expert_counts,
+        T,
+        stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
+        TOP_K=TOP_K,
+        BLOCK_T=BLOCK_T,
+        num_warps=4,
+    )
+
+    total_tokens = int(expert_counts.sum().item())
+    if total_tokens == 0:
+        return None
+
+    expert_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
+    expert_offsets[1:] = torch.cumsum(expert_counts, dim=0)
+
+    sorted_token_ids = torch.empty((total_tokens,), dtype=torch.int32, device=device)
+    sorted_weights = torch.empty((total_tokens,), dtype=torch.float32, device=device)
+    write_ptrs = expert_offsets[:-1].clone()
+
+    grid_scatter = (triton.cdiv(T, BLOCK_T),)
+    _scatter_local_tokens_kernel[grid_scatter](
+        local_ids,
+        local_weights,
+        write_ptrs,
+        sorted_token_ids,
+        sorted_weights,
+        T,
+        stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
+        TOP_K=TOP_K,
+        BLOCK_T=BLOCK_T,
+        num_warps=4,
+    )
+
+    return sorted_token_ids, sorted_weights, expert_counts, expert_offsets, total_tokens
 
 
 @torch.no_grad()
@@ -174,7 +505,7 @@ def run(
     routed_scaling_factor: float,
     output: torch.Tensor
 ):
-    # Constants per spec
+    # Constants
     H = 7168
     I = 2048
     E_global = 256
@@ -187,153 +518,135 @@ def run(
     NUM_I_BLOCKS = I // BLOCK            # 16
     NUM_G1_BLOCKS = (2 * I) // BLOCK     # 32
 
-    # Validate shapes and dtypes
-    assert hidden_states.dtype == torch.float8_e4m3fn, "hidden_states must be FLOAT8_E4M3FN"
-    assert gemm1_weights.dtype == torch.float8_e4m3fn, "gemm1_weights must be FLOAT8_E4M3FN"
-    assert gemm2_weights.dtype == torch.float8_e4m3fn, "gemm2_weights must be FLOAT8_E4M3FN"
-    assert routing_logits.dtype == torch.float32, "routing_logits must be float32"
-    assert routing_bias.dtype in (torch.float32, torch.bfloat16, torch.float16), "routing_bias must be float or bf16/fp16"
-    assert hidden_states_scale.dtype == torch.float32, "hidden_states_scale must be float32"
-    assert gemm1_weights_scale.dtype == torch.float32, "gemm1_weights_scale must be float32"
-    assert gemm2_weights_scale.dtype == torch.float32, "gemm2_weights_scale must be float32"
-
     T = int(routing_logits.shape[0])
-    assert routing_logits.shape[-1] == E_global, "routing_logits last dim must be 256"
-    assert hidden_states.shape == (T, H), "hidden_states must be [T, 7168]"
-    assert hidden_states_scale.shape == (NUM_H_BLOCKS, T), "hidden_states_scale must be [56, T]"
-    assert gemm1_weights.shape == (E_local, 2 * I, H), "gemm1_weights must be [32, 4096, 7168]"
-    assert gemm1_weights_scale.shape == (E_local, NUM_G1_BLOCKS, NUM_H_BLOCKS), "gemm1_weights_scale must be [32, 32, 56]"
-    assert gemm2_weights.shape == (E_local, H, I), "gemm2_weights must be [32, 7168, 2048]"
-    assert gemm2_weights_scale.shape == (E_local, NUM_H_BLOCKS, NUM_I_BLOCKS), "gemm2_weights_scale must be [32, 56, 16]"
+    device = hidden_states.device
+    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
 
-    # Device management
-    device = _ensure_cuda(routing_logits, routing_bias, hidden_states, hidden_states_scale,
-                          gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale)
-    orig_device = routing_logits.device
+    # ========================================================================
+    # Phase 1+2: Fused Routing + Token Permutation
+    # ========================================================================
+    route_outputs = _route_and_permute_local_fused(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        routed_scaling_factor=routed_scaling_factor,
+        local_expert_offset=local_expert_offset,
+        E_global=E_global,
+        E_local=E_local,
+        TOP_K=TOP_K,
+        N_GROUP=N_GROUP,
+        TOPK_GROUP=TOPK_GROUP,
+    )
 
-    # Move tensors to CUDA if needed
-    routing_logits_cu = _check_cuda_and_move(routing_logits, device).contiguous()
-    routing_bias_cu = _check_cuda_and_move(routing_bias.to(torch.float32), device).contiguous()
-    hidden_states_cu = _check_cuda_and_move(hidden_states, device).contiguous()
-    hidden_states_scale_cu = _check_cuda_and_move(hidden_states_scale, device).contiguous()
-    gemm1_weights_cu = _check_cuda_and_move(gemm1_weights, device).contiguous()
-    gemm1_weights_scale_cu = _check_cuda_and_move(gemm1_weights_scale, device).contiguous()
-    gemm2_weights_cu = _check_cuda_and_move(gemm2_weights, device).contiguous()
-    gemm2_weights_scale_cu = _check_cuda_and_move(gemm2_weights_scale, device).contiguous()
+    if route_outputs is None:
+        output.zero_()
+        return
 
-    # 1) Routing (DeepSeek-V3 no-aux) on CUDA (PyTorch)
-    logits = routing_logits_cu.to(torch.float32)                      # [T, E]
-    bias = routing_bias_cu.to(torch.float32).reshape(-1)              # [E]
-    s = torch.sigmoid(logits)                                         # [T, E]
-    s_with_bias = s + bias                                            # [T, E]
+    sorted_token_ids, sorted_weights, expert_counts, expert_offsets, total_tokens = route_outputs
 
-    group_size = E_global // N_GROUP  # 32
-    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)           # [T, 8, 32]
-    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)  # [T, 8, 2]
-    group_scores = top2_vals.sum(dim=2)                               # [T, 8]
-    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)  # [T, 4]
+    permuted_input = hidden_states.index_select(0, sorted_token_ids.long()).contiguous()
+    permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids.long()).contiguous()
 
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1.0)
-    score_mask = group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)
+    # ========================================================================
+    # Phase 3: Persistent Grouped GEMM1
+    # [total_tokens, H] x [E_local, 2*I, H]^T -> [total_tokens, 2*I]
+    # Single kernel launch for all experts
+    # ========================================================================
+    gemm1_out = torch.empty((total_tokens, 2 * I), dtype=torch.float32, device=device)
 
-    neg_inf = torch.finfo(torch.float32).min
-    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
-    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)  # [T, 8]
-
-    M = torch.zeros_like(s)
-    M.scatter_(1, topk_idx, 1.0)
-    weights = s * M
-    weights_sum = weights.sum(dim=1, keepdim=True) + 1e-20
-    weights = (weights / weights_sum) * float(routed_scaling_factor)
-
-    # 2) Allocate output accumulator in float32
-    out_accum = torch.zeros((T, H), dtype=torch.float32, device=device)
-
-    # 3) Launch fused per-local-expert kernels
-    # Tuned for B200: 64x128x128 tiles, 8 warps
     BLOCK_M = 64
     BLOCK_N = 128
     BLOCK_K = 128
-    BLOCK_I = 128
 
-    # Strides (in elements)
-    stride_hs_t = hidden_states_cu.stride(0)
-    stride_hs_h = hidden_states_cu.stride(1)
-    stride_hs_scale_hb = hidden_states_scale_cu.stride(0)
-    stride_hs_scale_t = hidden_states_scale_cu.stride(1)
+    num_n_tiles_g1 = (2 * I) // BLOCK_N  # 32
+    tile_offsets_g1 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g1, device)
+    total_tiles_g1 = int(tile_offsets_g1[-1].item())
 
-    local_start = int(local_expert_offset)
-    for le in range(E_local):
-        ge = local_start + le
-        if ge < 0 or ge >= E_global:
-            continue
-
-        # Tokens routed to this expert
-        sel_mask = (topk_idx == ge).any(dim=1)  # [T]
-        if not torch.any(sel_mask):
-            continue
-
-        tok_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1).to(torch.int32).contiguous()
-        Tk_local = int(tok_idx.numel())
-
-        # Per-token routing weights for this expert
-        w_tok = weights.index_select(0, tok_idx.to(torch.int64))[:, ge].to(torch.float32).contiguous()
-
-        # Expert slices
-        w13_e = gemm1_weights_cu[le]                     # [2I, H], fp8
-        s13_e = gemm1_weights_scale_cu[le]               # [32, 56], fp32
-        w2_e = gemm2_weights_cu[le]                      # [H, I], fp8
-        s2_e = gemm2_weights_scale_cu[le]                # [56, 16], fp32
-
-        # Strides for expert tensors (in elements)
-        stride_w13_o = w13_e.stride(0)
-        stride_w13_h = w13_e.stride(1)
-        stride_s13_o = s13_e.stride(0)
-        stride_s13_hb = s13_e.stride(1)
-        stride_w2_h = w2_e.stride(0)
-        stride_w2_i = w2_e.stride(1)
-        stride_s2_hb = s2_e.stride(0)
-        stride_s2_ib = s2_e.stride(1)
-        stride_out_t = out_accum.stride(0)
-        stride_out_h = out_accum.stride(1)
-
-        # Grid: tokens and H tiles
-        grid_m = (Tk_local + BLOCK_M - 1) // BLOCK_M
-        grid_n = (H + BLOCK_N - 1) // BLOCK_N
-        if grid_m == 0 or grid_n == 0:
-            continue
-
-        _moe_le_fused_kernel[(grid_m, grid_n)](
-            # Pointers
-            hidden_states_cu, hidden_states_scale_cu,
-            T, H, I,
-            tok_idx, Tk_local,
-            w13_e, s13_e,
-            w2_e, s2_e,
-            w_tok,
-            out_accum,
-            # Strides
-            stride_hs_t, stride_hs_h,
-            stride_hs_scale_hb, stride_hs_scale_t,
-            stride_w13_o, stride_w13_h,
-            stride_s13_o, stride_s13_hb,
-            stride_w2_h, stride_w2_i,
-            stride_s2_hb, stride_s2_ib,
-            stride_out_t, stride_out_h,
-            # Consts
-            NUM_H_BLOCKS, NUM_G1_BLOCKS, NUM_I_BLOCKS,
-            BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_I,
-            num_warps=8,
-            num_stages=3
+    if total_tiles_g1 > 0:
+        grid_g1 = (min(NUM_SMS, total_tiles_g1),)
+        _persistent_gemm1_kernel[grid_g1](
+            permuted_input, permuted_hs_scale,
+            gemm1_weights, gemm1_weights_scale,
+            gemm1_out,
+            expert_offsets, tile_offsets_g1,
+            total_tiles_g1,
+            K=H, N=2 * I,
+            NUM_K_BLOCKS=NUM_H_BLOCKS,
+            E_LOCAL=E_local,
+            stride_a_t=permuted_input.stride(0), stride_a_k=permuted_input.stride(1),
+            stride_as_kb=permuted_hs_scale.stride(0), stride_as_t=permuted_hs_scale.stride(1),
+            stride_b_e=gemm1_weights.stride(0), stride_b_n=gemm1_weights.stride(1), stride_b_k=gemm1_weights.stride(2),
+            stride_bs_e=gemm1_weights_scale.stride(0), stride_bs_nb=gemm1_weights_scale.stride(1), stride_bs_kb=gemm1_weights_scale.stride(2),
+            stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            NUM_SMS=NUM_SMS,
+            num_warps=8, num_stages=3,
         )
 
-    # 4) Convert to BF16 for output
-    out_bf16 = out_accum.to(torch.bfloat16)
+    # ========================================================================
+    # Phase 4: SwiGLU — [total_tokens, 4096] -> [total_tokens, 2048]
+    # ========================================================================
+    swiglu_out = torch.empty((total_tokens, I), dtype=torch.float32, device=device)
+    SWIGLU_BLOCK_T = 64
+    SWIGLU_BLOCK_I = 128
+    grid_swiglu = (
+        (total_tokens + SWIGLU_BLOCK_T - 1) // SWIGLU_BLOCK_T,
+        I // SWIGLU_BLOCK_I,
+    )
+    _swiglu_kernel[grid_swiglu](
+        gemm1_out, swiglu_out,
+        total_tokens, I=I,
+        BLOCK_T=SWIGLU_BLOCK_T, BLOCK_I=SWIGLU_BLOCK_I,
+        num_warps=4,
+    )
 
-    # Move back to original device if needed
-    if orig_device.type != 'cuda':
-        out_bf16 = out_bf16.cpu()
+    # ========================================================================
+    # Phase 5: Persistent Grouped GEMM2
+    # [total_tokens, I] x [E_local, H, I]^T -> [total_tokens, H]
+    # Single kernel launch for all experts
+    # ========================================================================
+    gemm2_out = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
 
-    # return out_bf16
-    output.copy_(out_bf16)
+    num_n_tiles_g2 = H // BLOCK_N  # 56
+    tile_offsets_g2 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g2, device)
+    total_tiles_g2 = int(tile_offsets_g2[-1].item())
+
+    if total_tiles_g2 > 0:
+        grid_g2 = (min(NUM_SMS, total_tiles_g2),)
+        _persistent_gemm2_kernel[grid_g2](
+            swiglu_out,
+            gemm2_weights, gemm2_weights_scale,
+            gemm2_out,
+            expert_offsets, tile_offsets_g2,
+            total_tiles_g2,
+            K=I, N=H,
+            NUM_K_BLOCKS=NUM_I_BLOCKS,
+            E_LOCAL=E_local,
+            stride_a_t=swiglu_out.stride(0), stride_a_k=swiglu_out.stride(1),
+            stride_b_e=gemm2_weights.stride(0), stride_b_n=gemm2_weights.stride(1), stride_b_k=gemm2_weights.stride(2),
+            stride_bs_e=gemm2_weights_scale.stride(0), stride_bs_nb=gemm2_weights_scale.stride(1), stride_bs_kb=gemm2_weights_scale.stride(2),
+            stride_c_t=gemm2_out.stride(0), stride_c_n=gemm2_out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            NUM_SMS=NUM_SMS,
+            num_warps=8, num_stages=3,
+        )
+
+    # ========================================================================
+    # Phase 6: Weighted scatter-add — accumulate into output
+    # ========================================================================
+    out_accum = torch.zeros((T, H), dtype=torch.float32, device=device)
+
+    SCATTER_BLOCK_T = 64
+    SCATTER_BLOCK_H = 128
+    grid_scatter = (
+        (total_tokens + SCATTER_BLOCK_T - 1) // SCATTER_BLOCK_T,
+        H // SCATTER_BLOCK_H,
+    )
+    _weighted_scatter_add_kernel[grid_scatter](
+        gemm2_out, out_accum,
+        sorted_token_ids, sorted_weights,
+        total_tokens, H=H,
+        BLOCK_T=SCATTER_BLOCK_T, BLOCK_H=SCATTER_BLOCK_H,
+        num_warps=4,
+    )
+
+    output.copy_(out_accum.to(torch.bfloat16))

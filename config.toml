@@ -1,7 +1,7 @@
 [solution]
-name = "gpt-5-2025-08-07_triton_e4fddf"      # Solution name
+name = "the_fused_experts"      # Solution name
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "gpt-5-2025-08-07"              # Team/author name
+author = "the_fused_experts"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
