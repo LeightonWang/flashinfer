@@ -262,6 +262,143 @@ def _weighted_scatter_add_kernel(
     tl.atomic_add(dst_ptrs, vals, mask=mask_t[:, None])
 
 
+@triton.jit
+def _route_select_local_kernel(
+    routing_logits_ptr,    # [T, E_global], fp32/fp16/bf16
+    routing_bias_ptr,      # [E_global], fp32
+    local_ids_ptr,         # [T, TOP_K], int32 (-1 means non-local)
+    local_weights_ptr,     # [T, TOP_K], fp32
+    T,
+    stride_rl_t, stride_rl_e,
+    stride_local_t, stride_local_k,
+    local_start,
+    routed_scaling_factor,
+    E_GLOBAL: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    TOP_K: tl.constexpr,
+    N_GROUP: tl.constexpr,
+    TOPK_GROUP: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= T:
+        return
+
+    neg_inf_e = tl.full((E_GLOBAL,), -float("inf"), dtype=tl.float32)
+    neg_inf_g = tl.full((N_GROUP,), -float("inf"), dtype=tl.float32)
+
+    e = tl.arange(0, E_GLOBAL)
+    groups = tl.arange(0, N_GROUP)
+    k_arange = tl.arange(0, TOP_K)
+
+    logits = tl.load(routing_logits_ptr + pid * stride_rl_t + e * stride_rl_e).to(tl.float32)
+    bias = tl.load(routing_bias_ptr + e).to(tl.float32)
+
+    s = tl.sigmoid(logits)
+    s_with_bias = s + bias
+
+    group_scores = tl.zeros((N_GROUP,), dtype=tl.float32)
+    for g in range(N_GROUP):
+        g_lo = g * GROUP_SIZE
+        in_group = (e >= g_lo) & (e < g_lo + GROUP_SIZE)
+        vals = tl.where(in_group, s_with_bias, neg_inf_e)
+        idx1 = tl.argmax(vals, axis=0)
+        vals_wo_top1 = tl.where(in_group & (e != idx1), s_with_bias, neg_inf_e)
+        max1 = tl.max(vals, axis=0)
+        max2 = tl.max(vals_wo_top1, axis=0)
+        score = (max1 + max2).to(tl.float32)
+        group_scores = tl.where(groups == g, score, group_scores)
+
+    pruned_scores = tl.full((E_GLOBAL,), -float("inf"), dtype=tl.float32)
+    selected_groups = tl.zeros((N_GROUP,), dtype=tl.int32)
+    for _ in range(TOPK_GROUP):
+        masked_group_scores = tl.where(selected_groups > 0, neg_inf_g, group_scores)
+        g_sel = tl.argmax(masked_group_scores, axis=0)
+        selected_groups = selected_groups + (groups == g_sel).to(tl.int32)
+
+        in_group = (e >= g_sel * GROUP_SIZE) & (e < (g_sel + 1) * GROUP_SIZE)
+        pruned_scores = tl.where(in_group, s_with_bias, pruned_scores)
+
+    selected_experts = tl.zeros((E_GLOBAL,), dtype=tl.int32)
+    topk_ids = tl.zeros((TOP_K,), dtype=tl.int32)
+    topk_s = tl.zeros((TOP_K,), dtype=tl.float32)
+    for k in range(TOP_K):
+        masked_scores = tl.where(selected_experts > 0, neg_inf_e, pruned_scores)
+        e_sel = tl.argmax(masked_scores, axis=0)
+        selected_experts = selected_experts + (e == e_sel).to(tl.int32)
+
+        s_sel = tl.sum(tl.where(e == e_sel, s, 0.0), axis=0)
+        topk_ids = tl.where(k_arange == k, e_sel.to(tl.int32), topk_ids)
+        topk_s = tl.where(k_arange == k, s_sel, topk_s)
+
+    denom = tl.sum(topk_s, axis=0)
+
+    local_ids = tl.full((TOP_K,), -1, dtype=tl.int32)
+    local_weights = tl.zeros((TOP_K,), dtype=tl.float32)
+    for k in range(TOP_K):
+        k_mask = k_arange == k
+        expert_id = tl.sum(tl.where(k_mask, topk_ids, 0), axis=0)
+        topk_s_k = tl.sum(tl.where(k_mask, topk_s, 0.0), axis=0)
+        is_local = (expert_id >= local_start) & (expert_id < local_start + E_LOCAL)
+        local_id = expert_id - local_start
+        w = (topk_s_k * routed_scaling_factor / (denom + 1e-20)).to(tl.float32)
+        local_ids = tl.where(k_mask & is_local, local_id.to(tl.int32), local_ids)
+        local_weights = tl.where(k_mask & is_local, w, local_weights)
+
+    out_ptr = local_ids_ptr + pid * stride_local_t + k_arange * stride_local_k
+    out_w_ptr = local_weights_ptr + pid * stride_local_t + k_arange * stride_local_k
+    tl.store(out_ptr, local_ids)
+    tl.store(out_w_ptr, local_weights)
+
+
+@triton.jit
+def _count_local_experts_kernel(
+    local_ids_ptr,         # [T, TOP_K], int32
+    expert_counts_ptr,     # [E_local], int32
+    T,
+    stride_local_t, stride_local_k,
+    TOP_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+
+    for k in range(TOP_K):
+        ids = tl.load(local_ids_ptr + offs_t * stride_local_t + k * stride_local_k, mask=mask_t, other=-1)
+        valid = ids >= 0
+        ids_safe = tl.where(valid, ids, 0)
+        tl.atomic_add(expert_counts_ptr + ids_safe, 1, mask=mask_t & valid)
+
+
+@triton.jit
+def _scatter_local_tokens_kernel(
+    local_ids_ptr,         # [T, TOP_K], int32
+    local_weights_ptr,     # [T, TOP_K], fp32
+    write_ptrs_ptr,        # [E_local], int32 (initialized from expert_offsets[:-1])
+    sorted_token_ids_ptr,  # [total_tokens], int32
+    sorted_weights_ptr,    # [total_tokens], fp32
+    T,
+    stride_local_t, stride_local_k,
+    TOP_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+
+    for k in range(TOP_K):
+        ids = tl.load(local_ids_ptr + offs_t * stride_local_t + k * stride_local_k, mask=mask_t, other=-1)
+        w = tl.load(local_weights_ptr + offs_t * stride_local_t + k * stride_local_k, mask=mask_t, other=0.0)
+
+        valid = mask_t & (ids >= 0)
+        ids_safe = tl.where(valid, ids, 0)
+
+        pos = tl.atomic_add(write_ptrs_ptr + ids_safe, 1, mask=valid)
+        tl.store(sorted_token_ids_ptr + pos, offs_t.to(tl.int32), mask=valid)
+        tl.store(sorted_weights_ptr + pos, w, mask=valid)
+
+
 def _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles, device):
     """Compute prefix-sum of tile counts per expert for persistent scheduling."""
     E_local = expert_counts.numel()
@@ -271,6 +408,87 @@ def _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles, device):
     tile_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
     tile_offsets[1:] = torch.cumsum(tiles_per_expert, dim=0)
     return tile_offsets
+
+
+def _route_and_permute_local_fused(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    routed_scaling_factor: float,
+    local_expert_offset: int,
+    E_global: int,
+    E_local: int,
+    TOP_K: int,
+    N_GROUP: int,
+    TOPK_GROUP: int,
+):
+    """Triton-backed fused routing + local permutation with downstream-compatible outputs."""
+    T = int(routing_logits.shape[0])
+    device = routing_logits.device
+
+    group_size = E_global // N_GROUP
+    local_ids = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
+    local_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
+
+    grid_route = (T,)
+    _route_select_local_kernel[grid_route](
+        routing_logits,
+        routing_bias,
+        local_ids,
+        local_weights,
+        T,
+        stride_rl_t=routing_logits.stride(0), stride_rl_e=routing_logits.stride(1),
+        stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
+        local_start=int(local_expert_offset),
+        routed_scaling_factor=float(routed_scaling_factor),
+        E_GLOBAL=E_global,
+        E_LOCAL=E_local,
+        TOP_K=TOP_K,
+        N_GROUP=N_GROUP,
+        TOPK_GROUP=TOPK_GROUP,
+        GROUP_SIZE=group_size,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    expert_counts = torch.zeros((E_local,), dtype=torch.int32, device=device)
+    BLOCK_T = 128
+    grid_count = (triton.cdiv(T, BLOCK_T),)
+    _count_local_experts_kernel[grid_count](
+        local_ids,
+        expert_counts,
+        T,
+        stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
+        TOP_K=TOP_K,
+        BLOCK_T=BLOCK_T,
+        num_warps=4,
+    )
+
+    total_tokens = int(expert_counts.sum().item())
+    if total_tokens == 0:
+        return None
+
+    expert_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
+    expert_offsets[1:] = torch.cumsum(expert_counts, dim=0)
+
+    sorted_token_ids = torch.empty((total_tokens,), dtype=torch.int32, device=device)
+    sorted_weights = torch.empty((total_tokens,), dtype=torch.float32, device=device)
+    write_ptrs = expert_offsets[:-1].clone()
+
+    grid_scatter = (triton.cdiv(T, BLOCK_T),)
+    _scatter_local_tokens_kernel[grid_scatter](
+        local_ids,
+        local_weights,
+        write_ptrs,
+        sorted_token_ids,
+        sorted_weights,
+        T,
+        stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
+        TOP_K=TOP_K,
+        BLOCK_T=BLOCK_T,
+        num_warps=4,
+    )
+
+    return sorted_token_ids, sorted_weights, expert_counts, expert_offsets, total_tokens
 
 
 @torch.no_grad()
@@ -305,61 +523,25 @@ def run(
     NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
 
     # ========================================================================
-    # Phase 1: Routing (DeepSeek-V3 no-aux) — PyTorch on CUDA
+    # Phase 1+2: Fused Routing + Token Permutation
     # ========================================================================
-    logits = routing_logits.to(torch.float32)
-    bias = routing_bias.to(torch.float32).reshape(-1)
-    s = torch.sigmoid(logits)
-    s_with_bias = s + bias
+    route_outputs = _route_and_permute_local_fused(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        routed_scaling_factor=routed_scaling_factor,
+        local_expert_offset=local_expert_offset,
+        E_global=E_global,
+        E_local=E_local,
+        TOP_K=TOP_K,
+        N_GROUP=N_GROUP,
+        TOPK_GROUP=TOPK_GROUP,
+    )
 
-    group_size = E_global // N_GROUP  # 32
-    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)
-    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
-    group_scores = top2_vals.sum(dim=2)
-    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)
-
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1.0)
-    score_mask = group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)
-
-    neg_inf = torch.finfo(torch.float32).min
-    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
-    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)
-
-    route_mask = torch.zeros_like(s)
-    route_mask.scatter_(1, topk_idx, 1.0)
-    weights = s * route_mask
-    weights_sum = weights.sum(dim=1, keepdim=True) + 1e-20
-    weights = (weights / weights_sum) * float(routed_scaling_factor)
-
-    # ========================================================================
-    # Phase 2: Token Permutation — sort tokens by expert
-    # ========================================================================
-    local_start = int(local_expert_offset)
-
-    local_expert_mask = (topk_idx >= local_start) & (topk_idx < local_start + E_local)
-    token_indices_expanded = torch.arange(T, device=device, dtype=torch.int32).unsqueeze(1).expand(T, TOP_K)
-
-    flat_token_ids = token_indices_expanded[local_expert_mask]
-    flat_expert_global = topk_idx[local_expert_mask]
-    flat_expert_local = flat_expert_global - local_start
-
-    flat_routing_weights = weights[flat_token_ids.long(), flat_expert_global.long()].to(torch.float32)
-
-    total_tokens = flat_token_ids.numel()
-
-    if total_tokens == 0:
+    if route_outputs is None:
         output.zero_()
         return
 
-    sorted_order = torch.argsort(flat_expert_local.to(torch.int64), stable=True)
-    sorted_token_ids = flat_token_ids[sorted_order].to(torch.int32).contiguous()
-    sorted_expert_local = flat_expert_local[sorted_order].to(torch.int64).contiguous()
-    sorted_weights = flat_routing_weights[sorted_order].contiguous()
-
-    expert_counts = torch.bincount(sorted_expert_local, minlength=E_local).to(torch.int32)
-    expert_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
-    expert_offsets[1:] = torch.cumsum(expert_counts, dim=0)
+    sorted_token_ids, sorted_weights, expert_counts, expert_offsets, total_tokens = route_outputs
 
     permuted_input = hidden_states.index_select(0, sorted_token_ids.long()).contiguous()
     permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids.long()).contiguous()
