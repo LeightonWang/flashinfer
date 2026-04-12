@@ -11,6 +11,7 @@ Setup (one-time):
 """
 
 import sys
+import argparse
 from pathlib import Path
 
 # Add project root to path for imports
@@ -31,8 +32,53 @@ image = (
 )
 
 
+def _run_with_optional_profile(benchmark: Benchmark, dump_traces: bool, enable_profile: bool, profile_output: str):
+    """Run benchmark with optional torch profiler trace export."""
+    if not enable_profile:
+        return benchmark.run_all(dump_traces=dump_traces)
+
+    import torch
+    from pathlib import Path
+
+    out_path = Path(profile_output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    with torch.profiler.profile(
+        activities=activities,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        result_trace_set = benchmark.run_all(dump_traces=dump_traces)
+
+    prof.export_chrome_trace(str(out_path))
+
+    summary_output = out_path.with_suffix(".summary.txt")
+    with open(summary_output, "w", encoding="utf-8") as f:
+        f.write(
+            prof.key_averages().table(
+                sort_by="self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total",
+                row_limit=60,
+            )
+        )
+
+    print(f"\n[profile] Chrome trace written to: {out_path}")
+    print(f"[profile] Kernel summary written to: {summary_output}")
+    return result_trace_set
+
+
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = 0) -> dict:
+def run_benchmark(
+    solution: Solution,
+    config: BenchmarkConfig = None,
+    max_workloads: int = 0,
+    enable_profile: bool = False,
+    profile_output: str = "/tmp/fib_profile_modal_trace.json",
+) -> dict:
     """Run benchmark on Modal B200 and return results.
 
     Args:
@@ -65,7 +111,12 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
     )
 
     benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
+    result_trace_set = _run_with_optional_profile(
+        benchmark,
+        dump_traces=True,
+        enable_profile=enable_profile,
+        profile_output=profile_output,
+    )
 
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
@@ -115,7 +166,7 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(max_workloads: int = 0):
+def main(max_workloads: int = 0, profile: bool = False, profile_output: str = "/tmp/fib_profile_modal_trace.json"):
     """Pack solution and run benchmark on Modal.
 
     Args:
@@ -131,7 +182,12 @@ def main(max_workloads: int = 0):
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution, max_workloads=max_workloads)
+    results = run_benchmark.remote(
+        solution,
+        max_workloads=max_workloads,
+        enable_profile=profile,
+        profile_output=profile_output,
+    )
 
     if not results:
         print("No results returned!")

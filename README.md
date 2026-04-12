@@ -118,6 +118,23 @@ for example, to run on the first 3 workloads:
 modal run scripts/run_modal.py --max-workloads 3
 ```
 
+## Profiling
+Now the `run_modal.py` script supports profiling with chrome trace format.
+```shell
+modal run scripts/run_modal.py  \
+--max-workloads 1 \
+--profile \
+--profile-output /data/profiles/fib_profile_modal_trace.json
+```
+`--profile` means enabling profiling, and `--profile-output` specifies the output path for the profile result in the Modal volume. You can change the path as needed.
+
+After the run, download the profile result from Modal volume to your local machine:
+
+```shell
+modal volume get flashinfer-trace /profiles/fib_profile_modal_trace.summary.txt ./artifacts/fib_profile_modal_trace.summary.txt
+```
+
+Then open your Chrome browser and navigate to `chrome://tracing`, click "Load" and select the downloaded `fib_profile_modal_trace.summary.txt` file to visualize the profiling results.
 
 ## Submission
 
