@@ -79,9 +79,26 @@ def _persistent_gemm1_kernel(
 
         # Row/col offsets in the global permuted array
         offs_m = e_tok_start + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
         nb = pid_n
+
+        # Create block pointers for TMA (Tensor Memory Accelerator) loads
+        a_block_ptr = tl.make_block_ptr(
+            base=A_ptr + e_tok_start * stride_a_t,
+            shape=(Tk, K),
+            strides=(stride_a_t, stride_a_k),
+            offsets=(pid_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_K),
+            order=(1, 0)
+        )
+        b_block_ptr = tl.make_block_ptr(
+            base=B_ptr + expert_id * stride_b_e,
+            shape=(N, K),
+            strides=(stride_b_n, stride_b_k),
+            offsets=(pid_n * BLOCK_N, 0),
+            block_shape=(BLOCK_N, BLOCK_K),
+            order=(1, 0)
+        )
 
         # Accumulator
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -89,23 +106,32 @@ def _persistent_gemm1_kernel(
         for kb in range(NUM_K_BLOCKS):
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-            # Load A tile: [BLOCK_M, BLOCK_K], keep fp8 for tensor cores
-            a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
-            a_fp8 = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+            # Load A tile: TMA block load (asynchronous hardware copy)
+            a_fp8 = tl.load(a_block_ptr, boundary_check=(0, 1))
 
-            # Load B tile: [BLOCK_N, BLOCK_K], keep fp8 for tensor cores
-            b_ptrs = B_ptr + expert_id * stride_b_e + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
-            b_fp8 = tl.load(b_ptrs)
+            # Load B tile: TMA block load
+            b_fp8 = tl.load(b_block_ptr, boundary_check=(0, 1))
 
             # FP8 Tensor Core dot + post-hoc scaling
             partial = tl.dot(a_fp8, tl.trans(b_fp8))
             sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
             sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
             acc += partial * sa[:, None] * sb
+            
+            # Advance TMA pointers to the next K block
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+            b_block_ptr = tl.advance(b_block_ptr, (0, BLOCK_K))
 
-        # Store
-        c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
-        tl.store(c_ptrs, acc, mask=mask_m[:, None])
+        # Store C tile using TMA
+        c_block_ptr = tl.make_block_ptr(
+            base=C_ptr + e_tok_start * stride_c_t,
+            shape=(Tk, N),
+            strides=(stride_c_t, stride_c_n),
+            offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+            block_shape=(BLOCK_M, BLOCK_N),
+            order=(1, 0)
+        )
+        tl.store(c_block_ptr, acc, boundary_check=(0, 1))
 
 
 # ============================================================================
@@ -161,30 +187,58 @@ def _persistent_gemm2_kernel(
         pid_n = tile_in_expert % num_n_tiles
 
         offs_m = e_tok_start + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
         nb = pid_n
+
+        # Create block pointers for TMA (Tensor Memory Accelerator) loads
+        a_block_ptr = tl.make_block_ptr(
+            base=A_ptr + e_tok_start * stride_a_t,
+            shape=(Tk, K),
+            strides=(stride_a_t, stride_a_k),
+            offsets=(pid_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_K),
+            order=(1, 0)
+        )
+        b_block_ptr = tl.make_block_ptr(
+            base=B_ptr + expert_id * stride_b_e,
+            shape=(N, K),
+            strides=(stride_b_n, stride_b_k),
+            offsets=(pid_n * BLOCK_N, 0),
+            block_shape=(BLOCK_N, BLOCK_K),
+            order=(1, 0)
+        )
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for kb in range(NUM_K_BLOCKS):
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-            # A: fp32
-            a_ptrs = A_ptr + offs_m[:, None] * stride_a_t + offs_k[None, :] * stride_a_k
-            a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+            # A: fp32, TMA load
+            a = tl.load(a_block_ptr, boundary_check=(0, 1))
 
-            # B: fp8 -> fp32
-            b_ptrs = B_ptr + expert_id * stride_b_e + offs_n[:, None] * stride_b_n + offs_k[None, :] * stride_b_k
-            b = tl.load(b_ptrs).to(tl.float32)
+            # B: fp8 -> fp32, TMA load
+            b_fp8 = tl.load(b_block_ptr, boundary_check=(0, 1))
+            b = b_fp8.to(tl.float32)
 
             sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
             b = b * sb
 
             acc += tl.dot(a, tl.trans(b))
 
-        c_ptrs = C_ptr + offs_m[:, None] * stride_c_t + offs_n[None, :] * stride_c_n
-        tl.store(c_ptrs, acc, mask=mask_m[:, None])
+            # Advance TMA pointers to the next K block
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+            b_block_ptr = tl.advance(b_block_ptr, (0, BLOCK_K))
+
+        # Store C tile using TMA
+        c_block_ptr = tl.make_block_ptr(
+            base=C_ptr + e_tok_start * stride_c_t,
+            shape=(Tk, N),
+            strides=(stride_c_t, stride_c_n),
+            offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+            block_shape=(BLOCK_M, BLOCK_N),
+            order=(1, 0)
+        )
+        tl.store(c_block_ptr, acc, boundary_check=(0, 1))
 
 
 # ============================================================================
