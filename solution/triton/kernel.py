@@ -1,6 +1,58 @@
 import torch
 import triton
 import triton.language as tl
+import os
+import json
+from pathlib import Path
+from contextlib import contextmanager
+
+
+@contextmanager
+def _profile_region(name: str):
+    if os.getenv("FIB_PROFILE_PHASES", "0") != "1":
+        yield
+        return
+
+    with torch.autograd.profiler.record_function(name):
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push(name)
+            try:
+                yield
+            finally:
+                torch.cuda.nvtx.range_pop()
+        else:
+            yield
+
+
+_PHASE_TIMING_EMITTED = False
+
+
+def _phase_timing_enabled() -> bool:
+    return (
+        os.getenv("FIB_PROFILE_PHASES", "0") == "1"
+        and bool(os.getenv("FIB_PHASE_TIMING_OUTPUT"))
+        and torch.cuda.is_available()
+    )
+
+
+def _emit_phase_timing(payload: dict) -> None:
+    global _PHASE_TIMING_EMITTED
+    if _PHASE_TIMING_EMITTED:
+        return
+
+    out_path = os.getenv("FIB_PHASE_TIMING_OUTPUT")
+    if not out_path:
+        return
+
+    try:
+        path = Path(out_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        _PHASE_TIMING_EMITTED = True
+    except Exception:
+        # Profiling export must never affect correctness/performance path.
+        pass
 
 
 # ============================================================================
@@ -602,29 +654,79 @@ def run(
     device = hidden_states.device
     NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
 
+    enable_phase_timing = _phase_timing_enabled() and (not _PHASE_TIMING_EMITTED)
+    phase_events = {}
+
+    def _phase_begin(phase_name: str):
+        if not enable_phase_timing:
+            return None
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+        return phase_name, start_evt, end_evt
+
+    def _phase_end(evt_tuple):
+        if (not enable_phase_timing) or (evt_tuple is None):
+            return
+        phase_name, start_evt, end_evt = evt_tuple
+        end_evt.record()
+        phase_events[phase_name] = (start_evt, end_evt)
+
+    def _finalize_phase_timing():
+        if (not enable_phase_timing) or (not phase_events):
+            return
+
+        torch.cuda.synchronize(device)
+
+        phase_ms = {}
+        total_ms = 0.0
+        for phase_name, (start_evt, end_evt) in phase_events.items():
+            elapsed_ms = float(start_evt.elapsed_time(end_evt))
+            phase_ms[phase_name] = elapsed_ms
+            total_ms += elapsed_ms
+
+        ratio_percent = {}
+        if total_ms > 0.0:
+            for phase_name, elapsed_ms in phase_ms.items():
+                ratio_percent[phase_name] = 100.0 * elapsed_ms / total_ms
+
+        _emit_phase_timing({
+            "total_tokens": int(total_tokens) if "total_tokens" in locals() else 0,
+            "phase_ms": phase_ms,
+            "ratio_percent": ratio_percent,
+            "total_ms": total_ms,
+        })
+
     # ========================================================================
     # Phase 1+2: Fused Routing + Token Permutation
     # ========================================================================
-    route_outputs = _route_and_permute_local_fused(
-        routing_logits=routing_logits,
-        routing_bias=routing_bias,
-        routed_scaling_factor=routed_scaling_factor,
-        local_expert_offset=local_expert_offset,
-        E_global=E_global,
-        E_local=E_local,
-        TOP_K=TOP_K,
-        N_GROUP=N_GROUP,
-        TOPK_GROUP=TOPK_GROUP,
-    )
+    phase_evt = _phase_begin("phase1_route_permute")
+    with _profile_region("phase1_route_permute"):
+        route_outputs = _route_and_permute_local_fused(
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
+            routed_scaling_factor=routed_scaling_factor,
+            local_expert_offset=local_expert_offset,
+            E_global=E_global,
+            E_local=E_local,
+            TOP_K=TOP_K,
+            N_GROUP=N_GROUP,
+            TOPK_GROUP=TOPK_GROUP,
+        )
+    _phase_end(phase_evt)
 
     if route_outputs is None:
         output.zero_()
+        _finalize_phase_timing()
         return
 
     sorted_token_ids, sorted_weights, expert_counts, expert_offsets, total_tokens = route_outputs
 
-    permuted_input = hidden_states.index_select(0, sorted_token_ids.long()).contiguous()
-    permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids.long()).contiguous()
+    phase_evt = _phase_begin("phase2_input_permute")
+    with _profile_region("phase2_input_permute"):
+        permuted_input = hidden_states.index_select(0, sorted_token_ids.long()).contiguous()
+        permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids.long()).contiguous()
+    _phase_end(phase_evt)
 
     # ========================================================================
     # Phase 3: Persistent Grouped GEMM1
@@ -652,27 +754,30 @@ def run(
     tile_offsets_g1 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g1, device)
     total_tiles_g1 = int(tile_offsets_g1[-1].item())
 
-    if total_tiles_g1 > 0:
-        grid_g1 = (min(NUM_SMS, total_tiles_g1),)
-        _persistent_gemm1_kernel[grid_g1](
-            permuted_input, permuted_hs_scale,
-            gemm1_weights, gemm1_weights_scale,
-            gemm1_out,
-            expert_offsets, tile_offsets_g1,
-            total_tiles_g1,
-            K=H, N=2 * I,
-            NUM_K_BLOCKS=NUM_H_BLOCKS,
-            E_LOCAL=E_local,
-            stride_a_t=permuted_input.stride(0), stride_a_k=permuted_input.stride(1),
-            stride_as_kb=permuted_hs_scale.stride(0), stride_as_t=permuted_hs_scale.stride(1),
-            stride_b_e=gemm1_weights.stride(0), stride_b_n=gemm1_weights.stride(1), stride_b_k=gemm1_weights.stride(2),
-            stride_bs_e=gemm1_weights_scale.stride(0), stride_bs_nb=gemm1_weights_scale.stride(1), stride_bs_kb=gemm1_weights_scale.stride(2),
-            stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            NUM_SMS=NUM_SMS,
-            STORE_BF16=GEMM1_OUT_BF16,
-            num_warps=8, num_stages=3,
-        )
+    phase_evt = _phase_begin("phase3_gemm1")
+    with _profile_region("phase3_gemm1"):
+        if total_tiles_g1 > 0:
+            grid_g1 = (min(NUM_SMS, total_tiles_g1),)
+            _persistent_gemm1_kernel[grid_g1](
+                permuted_input, permuted_hs_scale,
+                gemm1_weights, gemm1_weights_scale,
+                gemm1_out,
+                expert_offsets, tile_offsets_g1,
+                total_tiles_g1,
+                K=H, N=2 * I,
+                NUM_K_BLOCKS=NUM_H_BLOCKS,
+                E_LOCAL=E_local,
+                stride_a_t=permuted_input.stride(0), stride_a_k=permuted_input.stride(1),
+                stride_as_kb=permuted_hs_scale.stride(0), stride_as_t=permuted_hs_scale.stride(1),
+                stride_b_e=gemm1_weights.stride(0), stride_b_n=gemm1_weights.stride(1), stride_b_k=gemm1_weights.stride(2),
+                stride_bs_e=gemm1_weights_scale.stride(0), stride_bs_nb=gemm1_weights_scale.stride(1), stride_bs_kb=gemm1_weights_scale.stride(2),
+                stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                NUM_SMS=NUM_SMS,
+                STORE_BF16=GEMM1_OUT_BF16,
+                num_warps=8, num_stages=3,
+            )
+    _phase_end(phase_evt)
 
     # ========================================================================
     # Phase 4: SwiGLU — [total_tokens, 4096] -> [total_tokens, 2048]
@@ -684,13 +789,16 @@ def run(
         (total_tokens + SWIGLU_BLOCK_T - 1) // SWIGLU_BLOCK_T,
         I // SWIGLU_BLOCK_I,
     )
-    _swiglu_kernel[grid_swiglu](
-        gemm1_out, swiglu_out,
-        total_tokens, I=I,
-        BLOCK_T=SWIGLU_BLOCK_T, BLOCK_I=SWIGLU_BLOCK_I,
-        STORE_BF16=SWIGLU_OUT_BF16,
-        num_warps=4,
-    )
+    phase_evt = _phase_begin("phase4_swiglu")
+    with _profile_region("phase4_swiglu"):
+        _swiglu_kernel[grid_swiglu](
+            gemm1_out, swiglu_out,
+            total_tokens, I=I,
+            BLOCK_T=SWIGLU_BLOCK_T, BLOCK_I=SWIGLU_BLOCK_I,
+            STORE_BF16=SWIGLU_OUT_BF16,
+            num_warps=4,
+        )
+    _phase_end(phase_evt)
 
     # ========================================================================
     # Phase 5: Persistent Grouped GEMM2
@@ -703,27 +811,30 @@ def run(
     tile_offsets_g2 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g2, device)
     total_tiles_g2 = int(tile_offsets_g2[-1].item())
 
-    if total_tiles_g2 > 0:
-        grid_g2 = (min(NUM_SMS, total_tiles_g2),)
-        _persistent_gemm2_kernel[grid_g2](
-            swiglu_out,
-            gemm2_weights, gemm2_weights_scale,
-            gemm2_out,
-            expert_offsets, tile_offsets_g2,
-            total_tiles_g2,
-            K=I, N=H,
-            NUM_K_BLOCKS=NUM_I_BLOCKS,
-            E_LOCAL=E_local,
-            stride_a_t=swiglu_out.stride(0), stride_a_k=swiglu_out.stride(1),
-            stride_b_e=gemm2_weights.stride(0), stride_b_n=gemm2_weights.stride(1), stride_b_k=gemm2_weights.stride(2),
-            stride_bs_e=gemm2_weights_scale.stride(0), stride_bs_nb=gemm2_weights_scale.stride(1), stride_bs_kb=gemm2_weights_scale.stride(2),
-            stride_c_t=gemm2_out.stride(0), stride_c_n=gemm2_out.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            NUM_SMS=NUM_SMS,
-            GEMM2_USE_BF16_DOT=GEMM2_USE_BF16_DOT,
-            STORE_BF16=GEMM2_OUT_BF16,
-            num_warps=8, num_stages=3,
-        )
+    phase_evt = _phase_begin("phase5_gemm2")
+    with _profile_region("phase5_gemm2"):
+        if total_tiles_g2 > 0:
+            grid_g2 = (min(NUM_SMS, total_tiles_g2),)
+            _persistent_gemm2_kernel[grid_g2](
+                swiglu_out,
+                gemm2_weights, gemm2_weights_scale,
+                gemm2_out,
+                expert_offsets, tile_offsets_g2,
+                total_tiles_g2,
+                K=I, N=H,
+                NUM_K_BLOCKS=NUM_I_BLOCKS,
+                E_LOCAL=E_local,
+                stride_a_t=swiglu_out.stride(0), stride_a_k=swiglu_out.stride(1),
+                stride_b_e=gemm2_weights.stride(0), stride_b_n=gemm2_weights.stride(1), stride_b_k=gemm2_weights.stride(2),
+                stride_bs_e=gemm2_weights_scale.stride(0), stride_bs_nb=gemm2_weights_scale.stride(1), stride_bs_kb=gemm2_weights_scale.stride(2),
+                stride_c_t=gemm2_out.stride(0), stride_c_n=gemm2_out.stride(1),
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                NUM_SMS=NUM_SMS,
+                GEMM2_USE_BF16_DOT=GEMM2_USE_BF16_DOT,
+                STORE_BF16=GEMM2_OUT_BF16,
+                num_warps=8, num_stages=3,
+            )
+    _phase_end(phase_evt)
 
     # ========================================================================
     # Phase 6: Weighted scatter-add — accumulate into output
@@ -736,12 +847,20 @@ def run(
         (total_tokens + SCATTER_BLOCK_T - 1) // SCATTER_BLOCK_T,
         H // SCATTER_BLOCK_H,
     )
-    _weighted_scatter_add_kernel[grid_scatter](
-        gemm2_out, out_accum,
-        sorted_token_ids, sorted_weights,
-        total_tokens, H=H,
-        BLOCK_T=SCATTER_BLOCK_T, BLOCK_H=SCATTER_BLOCK_H,
-        num_warps=8,
-    )
+    phase_evt = _phase_begin("phase6_scatter")
+    with _profile_region("phase6_scatter"):
+        _weighted_scatter_add_kernel[grid_scatter](
+            gemm2_out, out_accum,
+            sorted_token_ids, sorted_weights,
+            total_tokens, H=H,
+            BLOCK_T=SCATTER_BLOCK_T, BLOCK_H=SCATTER_BLOCK_H,
+            num_warps=8,
+        )
+    _phase_end(phase_evt)
 
-    output.copy_(out_accum.to(torch.bfloat16))
+    phase_evt = _phase_begin("phase7_output_cast")
+    with _profile_region("phase7_output_cast"):
+        output.copy_(out_accum.to(torch.bfloat16))
+    _phase_end(phase_evt)
+
+    _finalize_phase_timing()
