@@ -737,7 +737,6 @@ def run(
                 stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 NUM_SMS=NUM_SMS,
-                STORE_BF16=GEMM1_OUT_BF16,
                 num_warps=8, num_stages=3,
             )
     _phase_end(phase_evt)
