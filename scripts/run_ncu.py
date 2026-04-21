@@ -1,12 +1,14 @@
 import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
+SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 import modal
 from flashinfer_bench import TraceSet, Solution
 from flashinfer_bench.agents import flashinfer_bench_run_ncu
-from scripts.pack_solution import pack_solution
+from pack_solution import pack_solution
 
 app = modal.App("flashinfer-ncu")
 trace_volume = modal.Volume.from_name("flashinfer-trace")
