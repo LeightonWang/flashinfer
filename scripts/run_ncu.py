@@ -8,7 +8,6 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import modal
 from flashinfer_bench import TraceSet, Solution
 from flashinfer_bench.agents import flashinfer_bench_run_ncu
-from pack_solution import pack_solution
 
 app = modal.App("flashinfer-ncu")
 trace_volume = modal.Volume.from_name("flashinfer-trace")
@@ -36,6 +35,7 @@ def run_ncu_remote(solution: Solution):
 
 @app.local_entrypoint()
 def main():
+    from pack_solution import pack_solution  # local-only import; not uploaded to Modal container
     solution_path = pack_solution()
     solution = Solution.model_validate_json(solution_path.read_text())
     run_ncu_remote.remote(solution)
