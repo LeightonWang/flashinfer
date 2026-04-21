@@ -750,9 +750,22 @@ def run(
 
     gemm1_out = torch.empty((total_tokens, 2 * I), dtype=gemm1_dtype, device=device)
 
+    # Compute tile offsets on CPU to avoid two extra GPU→CPU syncs from .item().
+    # expert_counts is already ready (synced during total_tokens = ...sum().item()).
+    expert_counts_cpu = expert_counts.cpu()
+    m_tiles_cpu = (expert_counts_cpu + BLOCK_M - 1) // BLOCK_M
     num_n_tiles_g1 = (2 * I) // BLOCK_N  # 32
-    tile_offsets_g1 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g1, device)
-    total_tiles_g1 = int(tile_offsets_g1[-1].item())
+    num_n_tiles_g2 = H // BLOCK_N        # 56
+
+    tile_offsets_g1_cpu = torch.zeros(E_local + 1, dtype=torch.int32)
+    tile_offsets_g1_cpu[1:] = torch.cumsum(m_tiles_cpu * num_n_tiles_g1, dim=0)
+    total_tiles_g1 = int(tile_offsets_g1_cpu[-1])
+    tile_offsets_g1 = tile_offsets_g1_cpu.to(device, non_blocking=True)
+
+    tile_offsets_g2_cpu = torch.zeros(E_local + 1, dtype=torch.int32)
+    tile_offsets_g2_cpu[1:] = torch.cumsum(m_tiles_cpu * num_n_tiles_g2, dim=0)
+    total_tiles_g2 = int(tile_offsets_g2_cpu[-1])
+    tile_offsets_g2 = tile_offsets_g2_cpu.to(device, non_blocking=True)
 
     phase_evt = _phase_begin("phase3_gemm1")
     with _profile_region("phase3_gemm1"):
@@ -807,10 +820,6 @@ def run(
     # ========================================================================
     gemm2_out = torch.empty((total_tokens, H), dtype=gemm2_dtype, device=device)
 
-    num_n_tiles_g2 = H // BLOCK_N  # 56
-    tile_offsets_g2 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g2, device)
-    total_tiles_g2 = int(tile_offsets_g2[-1].item())
-
     phase_evt = _phase_begin("phase5_gemm2")
     with _profile_region("phase5_gemm2"):
         if total_tiles_g2 > 0:
@@ -860,7 +869,7 @@ def run(
 
     phase_evt = _phase_begin("phase7_output_cast")
     with _profile_region("phase7_output_cast"):
-        output.copy_(out_accum.to(torch.bfloat16))
+        output.copy_(out_accum)  # fuses fp32→bf16 cast with copy, avoids intermediate tensor
     _phase_end(phase_evt)
 
     _finalize_phase_timing()
