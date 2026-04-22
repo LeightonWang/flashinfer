@@ -90,6 +90,15 @@ Test your solution on your local GPU:
 python scripts/run_local.py
 ```
 
+Options:
+- `--max-workloads`: Run on a subset of workloads for quick testing (default: all workloads)
+
+For example, run only the first 3 workloads:
+
+```bash
+python scripts/run_local.py --max-workloads 3
+```
+
 Requires: Local CUDA-capable GPU and `FIB_DATASET_PATH` environment variable.
 
 ### Run Benchmarks on Modal (RECOMMENDED)

@@ -27,7 +27,7 @@ def get_trace_set_path() -> str:
     return path
 
 
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = 0) -> dict:
     """Run benchmark locally and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
@@ -43,6 +43,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
+        print(f"Running {len(workloads)} of {len(trace_set.workloads.get(solution.definition, []))} workloads")
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -98,8 +102,12 @@ def print_results(results: dict):
             print()
 
 
-def main():
-    """Pack solution and run benchmark."""
+def main(max_workloads: int = 0):
+    """Pack solution and run benchmark.
+
+    Args:
+        max_workloads: Max number of workloads to run. 0 means all.
+    """
     print("Packing solution from source files...")
     solution_path = pack_solution()
 
@@ -108,7 +116,7 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark...")
-    results = run_benchmark(solution)
+    results = run_benchmark(solution, max_workloads=max_workloads)
 
     if not results:
         print("No results returned!")
@@ -118,4 +126,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Pack solution and run local benchmark")
+    parser.add_argument(
+        "--max-workloads",
+        type=int,
+        default=0,
+        help="Max number of workloads to run. 0 means all.",
+    )
+    args = parser.parse_args()
+
+    main(max_workloads=args.max_workloads)
