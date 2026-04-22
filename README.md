@@ -90,6 +90,15 @@ Test your solution on your local GPU:
 python scripts/run_local.py
 ```
 
+Options:
+- `--max-workloads`: Run on a subset of workloads for quick testing (default: all workloads)
+
+For example, run only the first 3 workloads:
+
+```bash
+python scripts/run_local.py --max-workloads 3
+```
+
 Requires: Local CUDA-capable GPU and `FIB_DATASET_PATH` environment variable.
 
 ### Run Benchmarks on Modal (RECOMMENDED)
@@ -121,22 +130,79 @@ modal run scripts/run_modal.py --max-workloads 3
 ```
 
 ## Profiling
-Now the `run_modal.py` script supports profiling with chrome trace format.
+Now the `run_modal.py` script supports profiling and writes outputs to the Modal volume.
 ```shell
 modal run scripts/run_modal.py  \
 --max-workloads 1 \
 --profile \
 --profile-output /data/profiles/fib_profile_modal_trace.json
 ```
-`--profile` means enabling profiling, and `--profile-output` specifies the output path for the profile result in the Modal volume. You can change the path as needed.
+`--profile` enables profiling, and `--profile-output` is the path in Modal volume (`flashinfer-trace`).
 
-After the run, download the profile result from Modal volume to your local machine:
+After the run, download the profile files from Modal volume to your local machine:
 
 ```shell
-modal volume get flashinfer-trace /profiles/fib_profile_modal_trace.summary.txt ./artifacts/fib_profile_modal_trace.summary.txt
+modal volume get flashinfer-trace --force /profiles/fib_profile_modal_trace.json ./artifacts/fib_profile_modal_trace.json
+modal volume get flashinfer-trace --force /profiles/fib_profile_modal_trace.summary.txt ./artifacts/fib_profile_modal_trace.summary.txt
+modal volume get flashinfer-trace --force /profiles/fib_profile_modal_trace.phase.json ./artifacts/fib_profile_modal_trace.phase.json
 ```
 
-Then open your Chrome browser and navigate to `chrome://tracing`, click "Load" and select the downloaded `fib_profile_modal_trace.summary.txt` file to visualize the profiling results.
+Then open Chrome and navigate to `chrome://tracing`, click "Load", and select `fib_profile_modal_trace.json`.
+
+`fib_profile_modal_trace.summary.txt` is a human-readable text summary for quick hotspot inspection.
+
+`fib_profile_modal_trace.phase.json` contains one-shot in-worker phase timing (`phase1`~`phase7`) to help diagnose stage-level bottlenecks when the benchmark runtime uses subprocess execution.
+
+The generated profiling artifacts have different purposes:
+
+- `fib_profile_modal_trace.json`: Full Chrome trace timeline (`chrome://tracing`).
+- `fib_profile_modal_trace.summary.txt`: Aggregated hotspot table printed by torch profiler.
+- `fib_profile_modal_trace.phase.json`: Stage-level timing split from in-worker CUDA events.
+
+`fib_profile_modal_trace.phase.json` uses the following structure:
+
+```json
+{
+    "total_tokens": 29120,
+    "phase_ms": {
+        "phase1_route_permute": 1801.98,
+        "phase2_input_permute": 85.31,
+        "phase3_gemm1": 716.18,
+        "phase4_swiglu": 469.09,
+        "phase5_gemm2": 606.58,
+        "phase6_scatter": 392.15,
+        "phase7_output_cast": 0.34
+    },
+    "ratio_percent": {
+        "phase1_route_permute": 44.26,
+        "phase2_input_permute": 2.10,
+        "phase3_gemm1": 17.59,
+        "phase4_swiglu": 11.52,
+        "phase5_gemm2": 14.90,
+        "phase6_scatter": 9.63,
+        "phase7_output_cast": 0.01
+    },
+    "total_ms": 4071.63
+}
+```
+
+Quickly inspect the top phase bottlenecks:
+
+```shell
+python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("./artifacts/fib_profile_modal_trace.phase.json")
+data = json.loads(path.read_text())
+ratio = data.get("ratio_percent", {})
+phase_ms = data.get("phase_ms", {})
+
+print(f"total_tokens={data.get('total_tokens')}, total_ms={data.get('total_ms'):.3f}")
+for name, pct in sorted(ratio.items(), key=lambda kv: kv[1], reverse=True):
+        print(f"{name:24s}  {phase_ms.get(name, 0.0):9.3f} ms  {pct:6.2f}%")
+PY
+```
 
 ## Submission
 

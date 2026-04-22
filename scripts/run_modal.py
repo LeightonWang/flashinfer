@@ -37,37 +37,59 @@ def _run_with_optional_profile(benchmark: Benchmark, dump_traces: bool, enable_p
     if not enable_profile:
         return benchmark.run_all(dump_traces=dump_traces)
 
+    import os
     import torch
     from pathlib import Path
 
     out_path = Path(profile_output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    phase_output = out_path.with_suffix(".phase.json")
 
     activities = [torch.profiler.ProfilerActivity.CPU]
     if torch.cuda.is_available():
         activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-    with torch.profiler.profile(
-        activities=activities,
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-    ) as prof:
-        result_trace_set = benchmark.run_all(dump_traces=dump_traces)
+    prev_phase_mark = os.environ.get("FIB_PROFILE_PHASES")
+    prev_phase_output = os.environ.get("FIB_PHASE_TIMING_OUTPUT")
+    os.environ["FIB_PROFILE_PHASES"] = "1"
+    os.environ["FIB_PHASE_TIMING_OUTPUT"] = str(phase_output)
+    try:
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        ) as prof:
+            result_trace_set = benchmark.run_all(dump_traces=dump_traces)
+    finally:
+        if prev_phase_mark is None:
+            os.environ.pop("FIB_PROFILE_PHASES", None)
+        else:
+            os.environ["FIB_PROFILE_PHASES"] = prev_phase_mark
+
+        if prev_phase_output is None:
+            os.environ.pop("FIB_PHASE_TIMING_OUTPUT", None)
+        else:
+            os.environ["FIB_PHASE_TIMING_OUTPUT"] = prev_phase_output
 
     prof.export_chrome_trace(str(out_path))
 
     summary_output = out_path.with_suffix(".summary.txt")
+    summary_table = prof.key_averages().table(
+        sort_by="self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total",
+        row_limit=60,
+    )
     with open(summary_output, "w", encoding="utf-8") as f:
-        f.write(
-            prof.key_averages().table(
-                sort_by="self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total",
-                row_limit=60,
-            )
-        )
+        f.write(summary_table)
 
     print(f"\n[profile] Chrome trace written to: {out_path}")
     print(f"[profile] Kernel summary written to: {summary_output}")
+    if phase_output.exists():
+        print(f"[profile] Phase timing written to: {phase_output}")
+    else:
+        print(f"[profile] Phase timing file not found at: {phase_output}")
+    print("\n[profile] Top events (sorted by self CUDA/CPU time):")
+    print(summary_table)
     return result_trace_set
 
 
@@ -87,57 +109,77 @@ def run_benchmark(
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
-    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    import os
+    from pathlib import Path
 
-    if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+    prev_phase_mark = os.environ.get("FIB_PROFILE_PHASES")
+    prev_phase_output = os.environ.get("FIB_PHASE_TIMING_OUTPUT")
+    if enable_profile:
+        os.environ["FIB_PROFILE_PHASES"] = "1"
+        os.environ["FIB_PHASE_TIMING_OUTPUT"] = str(Path(profile_output).with_suffix(".phase.json"))
 
-    definition = trace_set.definitions[solution.definition]
-    workloads = trace_set.workloads.get(solution.definition, [])
+    try:
+        trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
-    if not workloads:
-        raise ValueError(f"No workloads found for definition '{solution.definition}'")
+        if solution.definition not in trace_set.definitions:
+            raise ValueError(f"Definition '{solution.definition}' not found in trace set")
 
-    if max_workloads > 0:
-        workloads = workloads[:max_workloads]
-        print(f"Running {len(workloads)} of {len(trace_set.workloads.get(solution.definition, []))} workloads")
+        definition = trace_set.definitions[solution.definition]
+        workloads = trace_set.workloads.get(solution.definition, [])
 
-    bench_trace_set = TraceSet(
-        root=trace_set.root,
-        definitions={definition.name: definition},
-        solutions={definition.name: [solution]},
-        workloads={definition.name: workloads},
-        traces={definition.name: []},
-    )
+        if not workloads:
+            raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = _run_with_optional_profile(
-        benchmark,
-        dump_traces=True,
-        enable_profile=enable_profile,
-        profile_output=profile_output,
-    )
+        if max_workloads > 0:
+            workloads = workloads[:max_workloads]
+            print(f"Running {len(workloads)} of {len(trace_set.workloads.get(solution.definition, []))} workloads")
 
-    traces = result_trace_set.traces.get(definition.name, [])
-    results = {definition.name: {}}
+        bench_trace_set = TraceSet(
+            root=trace_set.root,
+            definitions={definition.name: definition},
+            solutions={definition.name: [solution]},
+            workloads={definition.name: workloads},
+            traces={definition.name: []},
+        )
 
-    for trace in traces:
-        if trace.evaluation:
-            entry = {
-                "status": trace.evaluation.status.value,
-                "solution": trace.solution,
-                "log": trace.evaluation.log,
-            }
-            if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-            if trace.evaluation.correctness:
-                entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-            results[definition.name][trace.workload.uuid] = entry
+        benchmark = Benchmark(bench_trace_set, config)
+        result_trace_set = _run_with_optional_profile(
+            benchmark,
+            dump_traces=True,
+            enable_profile=enable_profile,
+            profile_output=profile_output,
+        )
 
-    return results
+        traces = result_trace_set.traces.get(definition.name, [])
+        results = {definition.name: {}}
+
+        for trace in traces:
+            if trace.evaluation:
+                entry = {
+                    "status": trace.evaluation.status.value,
+                    "solution": trace.solution,
+                    "log": trace.evaluation.log,
+                }
+                if trace.evaluation.performance:
+                    entry["latency_ms"] = trace.evaluation.performance.latency_ms
+                    entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
+                    entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
+                if trace.evaluation.correctness:
+                    entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
+                    entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+                results[definition.name][trace.workload.uuid] = entry
+
+        return results
+    finally:
+        if prev_phase_mark is None:
+            os.environ.pop("FIB_PROFILE_PHASES", None)
+        else:
+            os.environ["FIB_PROFILE_PHASES"] = prev_phase_mark
+
+        if prev_phase_output is None:
+            os.environ.pop("FIB_PHASE_TIMING_OUTPUT", None)
+        else:
+            os.environ["FIB_PHASE_TIMING_OUTPUT"] = prev_phase_output
 
 
 def print_results(results: dict):
