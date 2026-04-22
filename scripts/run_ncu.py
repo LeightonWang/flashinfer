@@ -6,7 +6,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import modal
-from flashinfer_bench import TraceSet, Solution
+from flashinfer_bench import TraceSet, Solution, Workload
 from flashinfer_bench.agents import flashinfer_bench_run_ncu
 
 app = modal.App("flashinfer-ncu")
@@ -18,11 +18,27 @@ image = (
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
 )
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_ncu_remote(solution: Solution):
+
+@app.function(image=image, volumes={TRACE_SET_PATH: trace_volume})
+def fetch_workload(definition: str) -> Workload:
+    """Load workload from Modal volume and return it to the local caller."""
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
-    workload = trace_set.workloads[solution.definition][0]  # 取第一个 workload
-    
+    workloads = trace_set.workloads.get(definition, [])
+    if not workloads:
+        raise ValueError(f"No workloads found for definition '{definition}'")
+    return workloads[0]
+
+
+@app.local_entrypoint()
+def main():
+    from pack_solution import pack_solution  # local-only; not uploaded to Modal container
+
+    solution_path = pack_solution()
+    solution = Solution.model_validate_json(solution_path.read_text())
+
+    # Fetch workload object from the volume, then run NCU locally as an agent call
+    workload = fetch_workload.remote(solution.definition)
+
     output = flashinfer_bench_run_ncu(
         solution=solution,
         workload=workload,
@@ -31,11 +47,3 @@ def run_ncu_remote(solution: Solution):
         timeout=300,
     )
     print(output)
-    return output
-
-@app.local_entrypoint()
-def main():
-    from pack_solution import pack_solution  # local-only import; not uploaded to Modal container
-    solution_path = pack_solution()
-    solution = Solution.model_validate_json(solution_path.read_text())
-    run_ncu_remote.remote(solution)
