@@ -374,6 +374,7 @@ def _route_select_local_kernel(
     routing_bias_ptr,      # [E_global], fp32
     local_ids_ptr,         # [T, TOP_K], int32 (-1 means non-local)
     local_weights_ptr,     # [T, TOP_K], fp32
+    expert_counts_ptr,     # [E_local], int32
     T,
     stride_rl_t, stride_rl_e,
     stride_local_t, stride_local_k,
@@ -390,66 +391,89 @@ def _route_select_local_kernel(
     if pid >= T:
         return
 
-    neg_inf_e = tl.full((E_GLOBAL,), -float("inf"), dtype=tl.float32)
+    neg_inf_group = tl.full((GROUP_SIZE,), -float("inf"), dtype=tl.float32)
     neg_inf_g = tl.full((N_GROUP,), -float("inf"), dtype=tl.float32)
+    neg_inf_cand = tl.full((TOPK_GROUP * GROUP_SIZE,), -float("inf"), dtype=tl.float32)
 
-    e = tl.arange(0, E_GLOBAL)
     groups = tl.arange(0, N_GROUP)
+    group_e = tl.arange(0, GROUP_SIZE)
+    topk_group_slots = tl.arange(0, TOPK_GROUP)
+    cand_arange = tl.arange(0, TOPK_GROUP * GROUP_SIZE)
     k_arange = tl.arange(0, TOP_K)
 
-    logits = tl.load(routing_logits_ptr + pid * stride_rl_t + e * stride_rl_e).to(tl.float32)
-    bias = tl.load(routing_bias_ptr + e).to(tl.float32)
-
-    s = tl.sigmoid(logits)
-    s_with_bias = s + bias
-
     group_scores = tl.zeros((N_GROUP,), dtype=tl.float32)
-    for g in range(N_GROUP):
-        g_lo = g * GROUP_SIZE
-        in_group = (e >= g_lo) & (e < g_lo + GROUP_SIZE)
-        vals = tl.where(in_group, s_with_bias, neg_inf_e)
-        idx1 = tl.argmax(vals, axis=0)
-        vals_wo_top1 = tl.where(in_group & (e != idx1), s_with_bias, neg_inf_e)
-        max1 = tl.max(vals, axis=0)
-        max2 = tl.max(vals_wo_top1, axis=0)
-        score = (max1 + max2).to(tl.float32)
-        group_scores = tl.where(groups == g, score, group_scores)
+    all_group_s = tl.zeros((N_GROUP, GROUP_SIZE), dtype=tl.float32)
+    all_group_scores = tl.zeros((N_GROUP, GROUP_SIZE), dtype=tl.float32)
 
-    pruned_scores = tl.full((E_GLOBAL,), -float("inf"), dtype=tl.float32)
+    for g in range(N_GROUP):
+        g_offs = g * GROUP_SIZE + group_e
+        g_logits = tl.load(routing_logits_ptr + pid * stride_rl_t + g_offs * stride_rl_e).to(tl.float32)
+        g_bias = tl.load(routing_bias_ptr + g_offs).to(tl.float32)
+        g_s = tl.sigmoid(g_logits)
+        g_scores = g_s + g_bias
+
+        g_idx1 = tl.argmax(g_scores, axis=0)
+        g_scores_wo_top1 = tl.where(group_e != g_idx1, g_scores, neg_inf_group)
+        g_top1 = tl.max(g_scores, axis=0)
+        g_top2 = tl.max(g_scores_wo_top1, axis=0)
+        group_scores = tl.where(groups == g, (g_top1 + g_top2).to(tl.float32), group_scores)
+
+        g_mask = groups == g
+        all_group_s = tl.where(g_mask[:, None], g_s[None, :], all_group_s)
+        all_group_scores = tl.where(g_mask[:, None], g_scores[None, :], all_group_scores)
+
     selected_groups = tl.zeros((N_GROUP,), dtype=tl.int32)
+    selected_group_ids = tl.zeros((TOPK_GROUP,), dtype=tl.int32)
     for _ in range(TOPK_GROUP):
         masked_group_scores = tl.where(selected_groups > 0, neg_inf_g, group_scores)
         g_sel = tl.argmax(masked_group_scores, axis=0)
         selected_groups = selected_groups + (groups == g_sel).to(tl.int32)
+        slot = tl.sum(selected_groups, axis=0) - 1
+        selected_group_ids = tl.where(topk_group_slots == slot, g_sel.to(tl.int32), selected_group_ids)
 
-        in_group = (e >= g_sel * GROUP_SIZE) & (e < (g_sel + 1) * GROUP_SIZE)
-        pruned_scores = tl.where(in_group, s_with_bias, pruned_scores)
+    cand_scores_2d = tl.zeros((TOPK_GROUP, GROUP_SIZE), dtype=tl.float32)
+    cand_s_2d = tl.zeros((TOPK_GROUP, GROUP_SIZE), dtype=tl.float32)
+    cand_ids_2d = tl.zeros((TOPK_GROUP, GROUP_SIZE), dtype=tl.int32)
+    for slot in range(TOPK_GROUP):
+        slot_mask = topk_group_slots == slot
+        g_sel = tl.sum(tl.where(slot_mask, selected_group_ids, 0), axis=0)
+        g_mask = groups == g_sel
 
-    selected_experts = tl.zeros((E_GLOBAL,), dtype=tl.int32)
+        row_scores = tl.sum(tl.where(g_mask[:, None], all_group_scores, 0.0), axis=0)
+        row_s = tl.sum(tl.where(g_mask[:, None], all_group_s, 0.0), axis=0)
+        row_ids = (g_sel * GROUP_SIZE + group_e).to(tl.int32)
+
+        cand_scores_2d = tl.where(slot_mask[:, None], row_scores[None, :], cand_scores_2d)
+        cand_s_2d = tl.where(slot_mask[:, None], row_s[None, :], cand_s_2d)
+        cand_ids_2d = tl.where(slot_mask[:, None], row_ids[None, :], cand_ids_2d)
+
+    cand_scores = cand_scores_2d.reshape([TOPK_GROUP * GROUP_SIZE])
+    cand_s = cand_s_2d.reshape([TOPK_GROUP * GROUP_SIZE])
+    cand_ids = cand_ids_2d.reshape([TOPK_GROUP * GROUP_SIZE])
+
+    selected_candidates = tl.zeros((TOPK_GROUP * GROUP_SIZE,), dtype=tl.int32)
     topk_ids = tl.zeros((TOP_K,), dtype=tl.int32)
     topk_s = tl.zeros((TOP_K,), dtype=tl.float32)
     for k in range(TOP_K):
-        masked_scores = tl.where(selected_experts > 0, neg_inf_e, pruned_scores)
-        e_sel = tl.argmax(masked_scores, axis=0)
-        selected_experts = selected_experts + (e == e_sel).to(tl.int32)
+        masked_scores = tl.where(selected_candidates > 0, neg_inf_cand, cand_scores)
+        c_sel = tl.argmax(masked_scores, axis=0)
+        selected_candidates = selected_candidates + (cand_arange == c_sel).to(tl.int32)
 
-        s_sel = tl.sum(tl.where(e == e_sel, s, 0.0), axis=0)
+        e_sel = tl.sum(tl.where(cand_arange == c_sel, cand_ids, 0), axis=0)
+        s_sel = tl.sum(tl.where(cand_arange == c_sel, cand_s, 0.0), axis=0)
         topk_ids = tl.where(k_arange == k, e_sel.to(tl.int32), topk_ids)
         topk_s = tl.where(k_arange == k, s_sel, topk_s)
 
     denom = tl.sum(topk_s, axis=0)
 
-    local_ids = tl.full((TOP_K,), -1, dtype=tl.int32)
-    local_weights = tl.zeros((TOP_K,), dtype=tl.float32)
-    for k in range(TOP_K):
-        k_mask = k_arange == k
-        expert_id = tl.sum(tl.where(k_mask, topk_ids, 0), axis=0)
-        topk_s_k = tl.sum(tl.where(k_mask, topk_s, 0.0), axis=0)
-        is_local = (expert_id >= local_start) & (expert_id < local_start + E_LOCAL)
-        local_id = expert_id - local_start
-        w = (topk_s_k * routed_scaling_factor / (denom + 1e-20)).to(tl.float32)
-        local_ids = tl.where(k_mask & is_local, local_id.to(tl.int32), local_ids)
-        local_weights = tl.where(k_mask & is_local, w, local_weights)
+    weights = (topk_s * routed_scaling_factor / (denom + 1e-20)).to(tl.float32)
+    is_local = (topk_ids >= local_start) & (topk_ids < local_start + E_LOCAL)
+    local_ids = tl.where(is_local, (topk_ids - local_start).to(tl.int32), tl.full((TOP_K,), -1, dtype=tl.int32))
+    local_weights = tl.where(is_local, weights, tl.zeros((TOP_K,), dtype=tl.float32))
+
+    # Fused local expert counting to remove a separate counting kernel launch.
+    ids_safe = tl.where(local_ids >= 0, local_ids, 0)
+    tl.atomic_add(expert_counts_ptr + ids_safe, 1, mask=local_ids >= 0)
 
     out_ptr = local_ids_ptr + pid * stride_local_t + k_arange * stride_local_k
     out_w_ptr = local_weights_ptr + pid * stride_local_t + k_arange * stride_local_k
@@ -534,6 +558,7 @@ def _route_and_permute_local_fused(
     group_size = E_global // N_GROUP
     local_ids = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
     local_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
+    expert_counts = torch.zeros((E_local,), dtype=torch.int32, device=device)
 
     grid_route = (T,)
     _route_select_local_kernel[grid_route](
@@ -541,6 +566,7 @@ def _route_and_permute_local_fused(
         routing_bias,
         local_ids,
         local_weights,
+        expert_counts,
         T,
         stride_rl_t=routing_logits.stride(0), stride_rl_e=routing_logits.stride(1),
         stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
@@ -552,29 +578,16 @@ def _route_and_permute_local_fused(
         N_GROUP=N_GROUP,
         TOPK_GROUP=TOPK_GROUP,
         GROUP_SIZE=group_size,
-        num_warps=1,
+        num_warps=4,
         num_stages=1,
     )
 
-    expert_counts = torch.zeros((E_local,), dtype=torch.int32, device=device)
     BLOCK_T = 128
-    grid_count = (triton.cdiv(T, BLOCK_T),)
-    _count_local_experts_kernel[grid_count](
-        local_ids,
-        expert_counts,
-        T,
-        stride_local_t=local_ids.stride(0), stride_local_k=local_ids.stride(1),
-        TOP_K=TOP_K,
-        BLOCK_T=BLOCK_T,
-        num_warps=4,
-    )
-
-    total_tokens = int(expert_counts.sum().item())
-    if total_tokens == 0:
-        return None
-
     expert_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
     expert_offsets[1:] = torch.cumsum(expert_counts, dim=0)
+    total_tokens = int(expert_offsets[-1].item())
+    if total_tokens == 0:
+        return None
 
     sorted_token_ids = torch.empty((total_tokens,), dtype=torch.int32, device=device)
     sorted_weights = torch.empty((total_tokens,), dtype=torch.float32, device=device)
