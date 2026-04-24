@@ -66,34 +66,28 @@ def _emit_phase_timing(payload: dict) -> None:
 # Tile mapping: global tile_id -> (expert_id, m_tile, n_tile) via
 # a prefix-sum table (tile_offsets) computed on host.
 # ============================================================================
+import triton
+import triton.language as tl
+
 @triton.jit
-def _persistent_gemm1_kernel(
-    # A (permuted input): [total_tokens, K], fp8
+def _fused_gemm1_swiglu_kernel(
     A_ptr,
-    # A scale: [num_k_blocks, total_tokens], fp32
     A_scale_ptr,
-    # B weights: [E_local, N, K], fp8 — contiguous per expert
     B_ptr,
-    # B scale: [E_local, num_n_blocks, num_k_blocks], fp32
     B_scale_ptr,
-    # C output: [total_tokens, N], fp32
-    C_ptr,
-    # Expert scheduling arrays (device tensors)
-    expert_offsets_ptr,   # [E_local + 1], int32 — cumsum of token counts
-    tile_offsets_ptr,     # [E_local + 1], int32 — cumsum of tile counts per expert
-    num_tiles,            # total number of tiles across all experts
-    # Dimensions
+    C_ptr,  # 这是 swiglu_out: [total_tokens, I], fp32
+    expert_offsets_ptr,
+    tile_offsets_ptr,
+    num_tiles,
     K: tl.constexpr,
-    N: tl.constexpr,
+    I: tl.constexpr, # 替换了原来的 N
     NUM_K_BLOCKS: tl.constexpr,
     E_LOCAL: tl.constexpr,
-    # Strides
     stride_a_t, stride_a_k,
     stride_as_kb, stride_as_t,
     stride_b_e, stride_b_n, stride_b_k,
     stride_bs_e, stride_bs_nb, stride_bs_kb,
     stride_c_t, stride_c_n,
-    # Tile sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -102,8 +96,7 @@ def _persistent_gemm1_kernel(
     start_pid = tl.program_id(0)
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        # Binary search to find which expert this tile belongs to
-        # tile_offsets[e] <= tile_id < tile_offsets[e+1]
+        # 1. 寻找当前 Tile 属于哪个 Expert (二分查找，与原版一致)
         lo = 0
         hi = E_LOCAL
         while lo < hi:
@@ -115,26 +108,27 @@ def _persistent_gemm1_kernel(
                 lo = mid + 1
         expert_id = lo
 
-        # Tile within this expert
         expert_tile_start = tl.load(tile_offsets_ptr + expert_id)
         tile_in_expert = tile_id - expert_tile_start
 
-        # Expert's token range
         e_tok_start = tl.load(expert_offsets_ptr + expert_id)
         e_tok_end = tl.load(expert_offsets_ptr + expert_id + 1)
         Tk = e_tok_end - e_tok_start
 
-        # Map tile_in_expert -> (m_tile, n_tile)
-        num_n_tiles = N // BLOCK_N
+        # 2. 映射 tile_in_expert -> (m_tile, n_tile)
+        # 注意：现在 num_n_tiles 是基于 I 的，而不是 2*I
+        num_n_tiles = I // BLOCK_N
         pid_m = tile_in_expert // num_n_tiles
         pid_n = tile_in_expert % num_n_tiles
 
-        # Row/col offsets in the global permuted array
         offs_m = e_tok_start + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) < Tk
-        nb = pid_n
 
-        # Create block pointers for TMA (Tensor Memory Accelerator) loads
+        # B_scale 的索引：gate 是前面的块，up 是加上偏移后的块
+        nb_gate = pid_n
+        nb_up = pid_n + (I // BLOCK_N)
+
+        # 3. 创建 TMA Block Pointers
         a_block_ptr = tl.make_block_ptr(
             base=A_ptr + e_tok_start * stride_a_t,
             shape=(Tk, K),
@@ -143,47 +137,72 @@ def _persistent_gemm1_kernel(
             block_shape=(BLOCK_M, BLOCK_K),
             order=(1, 0)
         )
-        b_block_ptr = tl.make_block_ptr(
+        
+        # B 矩阵在 N 维度的大小依然是 2*I
+        # Gate 取 [pid_n * BLOCK_N] 偏移，Up 取 [I + pid_n * BLOCK_N] 偏移
+        b_gate_block_ptr = tl.make_block_ptr(
             base=B_ptr + expert_id * stride_b_e,
-            shape=(N, K),
+            shape=(2 * I, K), 
             strides=(stride_b_n, stride_b_k),
             offsets=(pid_n * BLOCK_N, 0),
             block_shape=(BLOCK_N, BLOCK_K),
             order=(1, 0)
         )
+        
+        b_up_block_ptr = tl.make_block_ptr(
+            base=B_ptr + expert_id * stride_b_e,
+            shape=(2 * I, K),
+            strides=(stride_b_n, stride_b_k),
+            offsets=(I + pid_n * BLOCK_N, 0),
+            block_shape=(BLOCK_N, BLOCK_K),
+            order=(1, 0)
+        )
 
-        # Accumulator
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # 4. 初始化双累加器
+        acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+        # 5. 主循环
         for kb in range(NUM_K_BLOCKS):
             offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-            # Load A tile: TMA block load (asynchronous hardware copy)
+            # 异步 TMA 加载：A、B_gate、B_up
             a_fp8 = tl.load(a_block_ptr, boundary_check=(0, 1))
+            b_gate_fp8 = tl.load(b_gate_block_ptr, boundary_check=(0, 1))
+            b_up_fp8 = tl.load(b_up_block_ptr, boundary_check=(0, 1))
 
-            # Load B tile: TMA block load
-            b_fp8 = tl.load(b_block_ptr, boundary_check=(0, 1))
+            # Tensor Core 乘加
+            partial_gate = tl.dot(a_fp8, tl.trans(b_gate_fp8))
+            partial_up = tl.dot(a_fp8, tl.trans(b_up_fp8))
 
-            # FP8 Tensor Core dot + post-hoc scaling
-            partial = tl.dot(a_fp8, tl.trans(b_fp8))
+            # 读取 Scale 并反量化
             sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
-            sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
-            acc += partial * sa[:, None] * sb
-            
-            # Advance TMA pointers to the next K block
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-            b_block_ptr = tl.advance(b_block_ptr, (0, BLOCK_K))
+            sb_gate = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb_gate * stride_bs_nb + kb * stride_bs_kb)
+            sb_up = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb_up * stride_bs_nb + kb * stride_bs_kb)
 
-        # Store C tile using TMA
+            acc_gate += partial_gate * sa[:, None] * sb_gate
+            acc_up += partial_up * sa[:, None] * sb_up
+            
+            # 推进指针
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+            b_gate_block_ptr = tl.advance(b_gate_block_ptr, (0, BLOCK_K))
+            b_up_block_ptr = tl.advance(b_up_block_ptr, (0, BLOCK_K))
+
+        # 6. Epilogue: 寄存器内激活 (SwiGLU)
+        # silu(up) * gate
+        silu_up = acc_up * tl.sigmoid(acc_up)
+        result = silu_up * acc_gate
+
+        # 7. 存回显存：直接写入最终结果张量
         c_block_ptr = tl.make_block_ptr(
             base=C_ptr + e_tok_start * stride_c_t,
-            shape=(Tk, N),
+            shape=(Tk, I),  # 输出张量的 N 维度大小是 I
             strides=(stride_c_t, stride_c_n),
             offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
             block_shape=(BLOCK_M, BLOCK_N),
             order=(1, 0)
         )
-        tl.store(c_block_ptr, acc, boundary_check=(0, 1))
+        tl.store(c_block_ptr, result, boundary_check=(0, 1))
 
 
 # ============================================================================
@@ -716,63 +735,47 @@ def run(
     _phase_end(phase_evt)
 
     # ========================================================================
-    # Phase 3: Persistent Grouped GEMM1
-    # [total_tokens, H] x [E_local, 2*I, H]^T -> [total_tokens, 2*I]
+    # Phase 3: Fused Persistent Grouped GEMM1 + SwiGLU
+    # [total_tokens, H] x [E_local, 2*I, H]^T -> [total_tokens, I]
     # Single kernel launch for all experts
     # ========================================================================
-    gemm1_out = torch.empty((total_tokens, 2 * I), dtype=torch.float32, device=device)
+    # 直接分配最终的 SwiGLU 输出张量，节省了一半的显存开销！
+    swiglu_out = torch.empty((total_tokens, I), dtype=torch.float32, device=device)
 
     BLOCK_M = 64
-    BLOCK_N = 128
+    BLOCK_N = 128  # 注意：这是输出张量的切块大小
     BLOCK_K = 128
 
-    num_n_tiles_g1 = (2 * I) // BLOCK_N  # 32
-    tile_offsets_g1 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g1, device)
-    total_tiles_g1 = int(tile_offsets_g1[-1].item())
+    # 核心修改：切块数量基于 I，而不是 2*I。总 Tile 数量减半！
+    num_n_tiles_fused = I // BLOCK_N  
+    tile_offsets_fused = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_fused, device)
+    total_tiles_fused = int(tile_offsets_fused[-1].item())
 
-    phase_evt = _phase_begin("phase3_gemm1")
-    with _profile_region("phase3_gemm1"):
-        if total_tiles_g1 > 0:
-            grid_g1 = (min(NUM_SMS, total_tiles_g1),)
-            _persistent_gemm1_kernel[grid_g1](
+    phase_evt = _phase_begin("phase3_fused_gemm1_swiglu")
+    with _profile_region("phase3_fused_gemm1_swiglu"):
+        if total_tiles_fused > 0:
+            grid_fused = (min(NUM_SMS, total_tiles_fused),)
+            _fused_gemm1_swiglu_kernel[grid_fused](
                 permuted_input, permuted_hs_scale,
                 gemm1_weights, gemm1_weights_scale,
-                gemm1_out,
-                expert_offsets, tile_offsets_g1,
-                total_tiles_g1,
-                K=H, N=2 * I,
+                swiglu_out, # 直接输出到最终结果
+                expert_offsets, tile_offsets_fused,
+                total_tiles_fused,
+                K=H, I=I,  # 传入 I 而不是 N=2*I
                 NUM_K_BLOCKS=NUM_H_BLOCKS,
                 E_LOCAL=E_local,
                 stride_a_t=permuted_input.stride(0), stride_a_k=permuted_input.stride(1),
                 stride_as_kb=permuted_hs_scale.stride(0), stride_as_t=permuted_hs_scale.stride(1),
                 stride_b_e=gemm1_weights.stride(0), stride_b_n=gemm1_weights.stride(1), stride_b_k=gemm1_weights.stride(2),
                 stride_bs_e=gemm1_weights_scale.stride(0), stride_bs_nb=gemm1_weights_scale.stride(1), stride_bs_kb=gemm1_weights_scale.stride(2),
-                stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
+                stride_c_t=swiglu_out.stride(0), stride_c_n=swiglu_out.stride(1), # Strides for output
                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 NUM_SMS=NUM_SMS,
                 num_warps=8, num_stages=3,
             )
     _phase_end(phase_evt)
-
-    # ========================================================================
-    # Phase 4: SwiGLU — [total_tokens, 4096] -> [total_tokens, 2048]
-    # ========================================================================
-    swiglu_out = torch.empty((total_tokens, I), dtype=torch.float32, device=device)
-    SWIGLU_BLOCK_T = 64
-    SWIGLU_BLOCK_I = 128
-    grid_swiglu = (
-        (total_tokens + SWIGLU_BLOCK_T - 1) // SWIGLU_BLOCK_T,
-        I // SWIGLU_BLOCK_I,
-    )
-    phase_evt = _phase_begin("phase4_swiglu")
-    with _profile_region("phase4_swiglu"):
-        _swiglu_kernel[grid_swiglu](
-            gemm1_out, swiglu_out,
-            total_tokens, I=I,
-            BLOCK_T=SWIGLU_BLOCK_T, BLOCK_I=SWIGLU_BLOCK_I,
-            num_warps=4,
-        )
-    _phase_end(phase_evt)
+    
+    # Phase 4 代码被彻底删除！
 
     # ========================================================================
     # Phase 5: Persistent Grouped GEMM2
