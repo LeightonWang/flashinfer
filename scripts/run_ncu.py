@@ -48,8 +48,15 @@ def run_ncu(solution: Solution, workload_index: int = 0) -> str:
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    workload = workloads[workload_index]
-    print(f"[debug] Using workload [{workload_index}]: {workload.uuid}")
+    item = workloads[workload_index]
+    print(f"[debug] workloads[{workload_index}] type: {type(item).__name__}")
+    print(f"[debug] workloads[{workload_index}] attrs: {[a for a in dir(item) if not a.startswith('_')]}")
+
+    # trace_set.workloads may return Trace objects; extract the inner Workload if so
+    workload = getattr(item, 'workload', item)
+    print(f"[debug] workload type after extraction: {type(workload).__name__}")
+    workload_id = getattr(workload, 'uuid', repr(workload))
+    print(f"[debug] Using workload [{workload_index}]: {workload_id}")
 
     # --- set FIB_DATASET_PATH so flashinfer_bench_run_ncu can find traces ---
     os.environ["FIB_DATASET_PATH"] = TRACE_SET_PATH
