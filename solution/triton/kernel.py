@@ -374,7 +374,7 @@ def _route_select_local_kernel(
     routing_bias_ptr,      # [E_global], fp32
     local_ids_ptr,         # [T, TOP_K], int32 (-1 means non-local)
     local_weights_ptr,     # [T, TOP_K], fp32
-    expert_counts_ptr,     # [E_local], int32
+    expert_counts_ptr,     # [E_local], int32 - output for counting
     T,
     stride_rl_t, stride_rl_e,
     stride_local_t, stride_local_k,
@@ -480,26 +480,10 @@ def _route_select_local_kernel(
     tl.store(out_ptr, local_ids)
     tl.store(out_w_ptr, local_weights)
 
-
-@triton.jit
-def _count_local_experts_kernel(
-    local_ids_ptr,         # [T, TOP_K], int32
-    expert_counts_ptr,     # [E_local], int32
-    T,
-    stride_local_t, stride_local_k,
-    TOP_K: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs_t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    mask_t = offs_t < T
-
-    for k in range(TOP_K):
-        ids = tl.load(local_ids_ptr + offs_t * stride_local_t + k * stride_local_k, mask=mask_t, other=-1)
-        valid = ids >= 0
-        ids_safe = tl.where(valid, ids, 0)
-        tl.atomic_add(expert_counts_ptr + ids_safe, 1, mask=mask_t & valid)
-
+    # Count experts in the same pass
+    valid = local_ids >= 0
+    safe_ids = tl.where(valid, local_ids, 0)
+    tl.atomic_add(expert_counts_ptr + safe_ids, 1, mask=valid)
 
 @triton.jit
 def _scatter_local_tokens_kernel(
@@ -527,7 +511,6 @@ def _scatter_local_tokens_kernel(
         pos = tl.atomic_add(write_ptrs_ptr + ids_safe, 1, mask=valid)
         tl.store(sorted_token_ids_ptr + pos, offs_t.to(tl.int32), mask=valid)
         tl.store(sorted_weights_ptr + pos, w, mask=valid)
-
 
 def _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles, device):
     """Compute prefix-sum of tile counts per expert for persistent scheduling."""
