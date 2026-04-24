@@ -13,7 +13,10 @@ trace_volume = modal.Volume.from_name("flashinfer-trace")
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(
+        "nvcr.io/nvidia/cuda:12.6.3-devel-ubuntu22.04",
+        add_python="3.12",
+    )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
 )
 
@@ -22,6 +25,16 @@ image = (
 def run_ncu(solution: Solution, workload_index: int = 0) -> str:
     import os
     from flashinfer_bench.agents import flashinfer_bench_run_ncu
+
+    import shutil, subprocess
+    # --- debug: confirm ncu is available ---
+    ncu_path = shutil.which("ncu")
+    print(f"[debug] ncu path: {ncu_path}")
+    if ncu_path:
+        ver = subprocess.run(["ncu", "--version"], capture_output=True, text=True)
+        print(f"[debug] ncu version: {ver.stdout.strip()}")
+    else:
+        raise RuntimeError("ncu not found — image does not have Nsight Compute installed")
 
     # --- debug: confirm volume is mounted and trace data exists ---
     print(f"[debug] TRACE_SET_PATH = {TRACE_SET_PATH}")
