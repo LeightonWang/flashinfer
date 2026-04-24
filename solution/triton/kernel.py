@@ -471,10 +471,6 @@ def _route_select_local_kernel(
     local_ids = tl.where(is_local, (topk_ids - local_start).to(tl.int32), tl.full((TOP_K,), -1, dtype=tl.int32))
     local_weights = tl.where(is_local, weights, tl.zeros((TOP_K,), dtype=tl.float32))
 
-    # Fused local expert counting to remove a separate counting kernel launch.
-    ids_safe = tl.where(local_ids >= 0, local_ids, 0)
-    tl.atomic_add(expert_counts_ptr + ids_safe, 1, mask=local_ids >= 0)
-
     out_ptr = local_ids_ptr + pid * stride_local_t + k_arange * stride_local_k
     out_w_ptr = local_weights_ptr + pid * stride_local_t + k_arange * stride_local_k
     tl.store(out_ptr, local_ids)
