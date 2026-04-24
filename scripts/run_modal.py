@@ -98,6 +98,7 @@ def run_benchmark(
     solution: Solution,
     config: BenchmarkConfig = None,
     max_workloads: int = 0,
+    single_workload: int = 0,
     enable_profile: bool = False,
     profile_output: str = "/tmp/fib_profile_modal_trace.json",
 ) -> dict:
@@ -105,9 +106,13 @@ def run_benchmark(
 
     Args:
         max_workloads: Max number of workloads to run. 0 means all.
+        single_workload: Run only one workload by 1-based index. 0 disables.
     """
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+
+    if max_workloads > 0 and single_workload > 0:
+        raise ValueError("--max-workloads and --single-workload are mutually exclusive")
 
     import os
     from pathlib import Path
@@ -126,13 +131,32 @@ def run_benchmark(
 
         definition = trace_set.definitions[solution.definition]
         workloads = trace_set.workloads.get(solution.definition, [])
+        total_workloads = len(workloads)
 
         if not workloads:
             raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-        if max_workloads > 0:
+        if single_workload > 0:
+            if single_workload > total_workloads:
+                raise ValueError(
+                    f"single_workload={single_workload} out of range; available workloads: 1..{total_workloads}"
+                )
+
+            selected = workloads[single_workload - 1]
+            selected_uuid = None
+            if hasattr(selected, "workload") and hasattr(selected.workload, "uuid"):
+                selected_uuid = selected.workload.uuid
+            elif hasattr(selected, "uuid"):
+                selected_uuid = selected.uuid
+
+            workloads = [selected]
+            if selected_uuid:
+                print(f"Running single workload {single_workload}/{total_workloads}: {str(selected_uuid)[:8]}...")
+            else:
+                print(f"Running single workload {single_workload}/{total_workloads}")
+        elif max_workloads > 0:
             workloads = workloads[:max_workloads]
-            print(f"Running {len(workloads)} of {len(trace_set.workloads.get(solution.definition, []))} workloads")
+            print(f"Running {len(workloads)} of {total_workloads} workloads")
 
         bench_trace_set = TraceSet(
             root=trace_set.root,
@@ -208,12 +232,21 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(max_workloads: int = 0, profile: bool = False, profile_output: str = "/tmp/fib_profile_modal_trace.json"):
+def main(
+    max_workloads: int = 0,
+    single_workload: int = 0,
+    profile: bool = False,
+    profile_output: str = "/tmp/fib_profile_modal_trace.json",
+):
     """Pack solution and run benchmark on Modal.
 
     Args:
         max_workloads: Max number of workloads to run. 0 means all.
+        single_workload: Run only one workload by 1-based index. 0 disables.
     """
+    if max_workloads > 0 and single_workload > 0:
+        raise ValueError("--max-workloads and --single-workload are mutually exclusive")
+
     from scripts.pack_solution import pack_solution
 
     print("Packing solution from source files...")
@@ -227,6 +260,7 @@ def main(max_workloads: int = 0, profile: bool = False, profile_output: str = "/
     results = run_benchmark.remote(
         solution,
         max_workloads=max_workloads,
+        single_workload=single_workload,
         enable_profile=profile,
         profile_output=profile_output,
     )
