@@ -14,9 +14,11 @@ import sys
 import argparse
 from pathlib import Path
 
-# Add project root to path for imports
+# Add project root and scripts dir to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
+SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 import modal
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
@@ -214,7 +216,7 @@ def main(max_workloads: int = 0, profile: bool = False, profile_output: str = "/
     Args:
         max_workloads: Max number of workloads to run. 0 means all.
     """
-    from scripts.pack_solution import pack_solution
+    from pack_solution import pack_solution
 
     print("Packing solution from source files...")
     solution_path = pack_solution()

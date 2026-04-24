@@ -8,12 +8,14 @@ import os
 import sys
 from pathlib import Path
 
-# Add project root to path for imports
+# Add project root and scripts dir to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
+SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
-from scripts.pack_solution import pack_solution
+from pack_solution import pack_solution
 
 
 def get_trace_set_path() -> str:
