@@ -81,7 +81,6 @@ def _persistent_gemm1_kernel(
     # Expert scheduling arrays (device tensors)
     expert_offsets_ptr,   # [E_local + 1], int32 — cumsum of token counts
     tile_offsets_ptr,     # [E_local + 1], int32 — cumsum of tile counts per expert
-    num_tiles,            # total number of tiles across all experts
     # Dimensions
     K: tl.constexpr,
     N: tl.constexpr,
@@ -100,6 +99,9 @@ def _persistent_gemm1_kernel(
     NUM_SMS: tl.constexpr,
 ):
     start_pid = tl.program_id(0)
+    # Read total tile count from the device-side prefix-sum table to avoid a
+    # host-side .item() synchronization between phases.
+    num_tiles = tl.load(tile_offsets_ptr + E_LOCAL)
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         # Binary search to find which expert this tile belongs to
@@ -198,7 +200,6 @@ def _persistent_gemm2_kernel(
     C_ptr,                # fp32, [total_tokens, N]
     expert_offsets_ptr,
     tile_offsets_ptr,
-    num_tiles,
     K: tl.constexpr,
     N: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
@@ -213,6 +214,9 @@ def _persistent_gemm2_kernel(
     NUM_SMS: tl.constexpr,
 ):
     start_pid = tl.program_id(0)
+    # Read total tile count from the device-side prefix-sum table to avoid a
+    # host-side .item() synchronization between phases.
+    num_tiles = tl.load(tile_offsets_ptr + E_LOCAL)
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         # Binary search for expert
@@ -482,7 +486,7 @@ def _scatter_local_tokens_kernel(
     local_ids_ptr,         # [T, TOP_K], int32
     local_weights_ptr,     # [T, TOP_K], fp32
     write_ptrs_ptr,        # [E_local], int32 (initialized from expert_offsets[:-1])
-    sorted_token_ids_ptr,  # [total_tokens], int32
+    sorted_token_ids_ptr,  # [total_tokens], int64 (used directly by index_select / scatter)
     sorted_weights_ptr,    # [total_tokens], fp32
     T,
     stride_local_t, stride_local_k,
@@ -501,7 +505,7 @@ def _scatter_local_tokens_kernel(
         ids_safe = tl.where(valid, ids, 0)
 
         pos = tl.atomic_add(write_ptrs_ptr + ids_safe, 1, mask=valid)
-        tl.store(sorted_token_ids_ptr + pos, offs_t.to(tl.int32), mask=valid)
+        tl.store(sorted_token_ids_ptr + pos, offs_t.to(tl.int64), mask=valid)
         tl.store(sorted_weights_ptr + pos, w, mask=valid)
 
 
@@ -516,6 +520,57 @@ def _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles, device):
     return tile_offsets
 
 
+# ============================================================================
+# Fused tile-offsets kernel: in a single launch, produce both GEMM1 and GEMM2
+# tile_offsets prefix-sum tables. Replaces ~16 small host ops + 2 cumsum calls
+# (which were a major source of host-launch bubbles between phases).
+# ============================================================================
+@triton.jit
+def _compute_tile_offsets_fused_kernel(
+    expert_counts_ptr,        # [E_local], int32
+    tile_offsets_g1_ptr,      # [E_local + 1], int32 (output)
+    tile_offsets_g2_ptr,      # [E_local + 1], int32 (output)
+    BLOCK_M: tl.constexpr,
+    NUM_N_TILES_G1: tl.constexpr,
+    NUM_N_TILES_G2: tl.constexpr,
+    E_LOCAL: tl.constexpr,    # must equal expert_counts.numel(), a power of 2
+):
+    e = tl.arange(0, E_LOCAL)
+    counts = tl.load(expert_counts_ptr + e).to(tl.int32)
+    m_tiles = (counts + BLOCK_M - 1) // BLOCK_M
+    tiles_g1 = m_tiles * NUM_N_TILES_G1
+    tiles_g2 = m_tiles * NUM_N_TILES_G2
+
+    # Inclusive prefix sums in-register; both tables share the same m_tiles.
+    cum_g1 = tl.cumsum(tiles_g1, axis=0)
+    cum_g2 = tl.cumsum(tiles_g2, axis=0)
+
+    # tile_offsets[0] = 0, tile_offsets[1:E+1] = inclusive cumsum.
+    tl.store(tile_offsets_g1_ptr, 0)
+    tl.store(tile_offsets_g2_ptr, 0)
+    tl.store(tile_offsets_g1_ptr + 1 + e, cum_g1)
+    tl.store(tile_offsets_g2_ptr + 1 + e, cum_g2)
+
+
+def _compute_tile_offsets_fused(expert_counts, BLOCK_M, num_n_tiles_g1,
+                                num_n_tiles_g2, device):
+    """Single-launch replacement for two _compute_tile_offsets calls."""
+    E_local = expert_counts.numel()
+    tile_offsets_g1 = torch.empty(E_local + 1, dtype=torch.int32, device=device)
+    tile_offsets_g2 = torch.empty(E_local + 1, dtype=torch.int32, device=device)
+    _compute_tile_offsets_fused_kernel[(1,)](
+        expert_counts,
+        tile_offsets_g1,
+        tile_offsets_g2,
+        BLOCK_M=BLOCK_M,
+        NUM_N_TILES_G1=num_n_tiles_g1,
+        NUM_N_TILES_G2=num_n_tiles_g2,
+        E_LOCAL=E_local,
+        num_warps=1,
+    )
+    return tile_offsets_g1, tile_offsets_g2
+
+
 def _route_and_permute_local_fused(
     routing_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -526,6 +581,9 @@ def _route_and_permute_local_fused(
     TOP_K: int,
     N_GROUP: int,
     TOPK_GROUP: int,
+    BLOCK_M: int,
+    NUM_N_TILES_G1: int,
+    NUM_N_TILES_G2: int,
 ):
     """Triton-backed fused routing + local permutation with downstream-compatible outputs."""
     T = int(routing_logits.shape[0])
@@ -569,16 +627,29 @@ def _route_and_permute_local_fused(
         num_warps=4,
     )
 
-    total_tokens = int(expert_counts.sum().item())
+    # ---- Prefetch / overlap region -----------------------------------------
+    # Everything below only depends on `expert_counts` (a device tensor), NOT on
+    # the host-side `total_tokens`. We enqueue all of this BEFORE the blocking
+    # D2H copy so the GPU keeps making progress while the CPU waits on `.item()`,
+    # filling the launch bubbles that previously stalled this phase.
+    expert_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
+    torch.cumsum(expert_counts, dim=0, out=expert_offsets[1:])
+    write_ptrs = expert_offsets[:-1].clone()
+
+    # GEMM1/GEMM2 persistent tile_offsets (read on-device by the GEMM kernels).
+    tile_offsets_g1, tile_offsets_g2 = _compute_tile_offsets_fused(
+        expert_counts, BLOCK_M, NUM_N_TILES_G1, NUM_N_TILES_G2, device,
+    )
+
+    # `total_tokens == expert_offsets[-1]`; reuse it instead of a separate
+    # reduction kernel. The single blocking D2H read is unavoidable here because
+    # the permuted-token buffers must be sized on the host.
+    total_tokens = int(expert_offsets[E_local].item())
     if total_tokens == 0:
         return None
 
-    expert_offsets = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
-    expert_offsets[1:] = torch.cumsum(expert_counts, dim=0)
-
-    sorted_token_ids = torch.empty((total_tokens,), dtype=torch.int32, device=device)
+    sorted_token_ids = torch.empty((total_tokens,), dtype=torch.int64, device=device)
     sorted_weights = torch.empty((total_tokens,), dtype=torch.float32, device=device)
-    write_ptrs = expert_offsets[:-1].clone()
 
     grid_scatter = (triton.cdiv(T, BLOCK_T),)
     _scatter_local_tokens_kernel[grid_scatter](
@@ -594,7 +665,8 @@ def _route_and_permute_local_fused(
         num_warps=4,
     )
 
-    return sorted_token_ids, sorted_weights, expert_counts, expert_offsets, total_tokens
+    return (sorted_token_ids, sorted_weights, expert_counts, expert_offsets,
+            total_tokens, tile_offsets_g1, tile_offsets_g2)
 
 
 @torch.no_grad()
@@ -674,6 +746,15 @@ def run(
     # ========================================================================
     # Phase 1+2: Fused Routing + Token Permutation
     # ========================================================================
+    # GEMM tiling constants are needed up-front because the persistent
+    # tile_offsets are now computed inside the routing helper (prefetched before
+    # the host-side token-count sync to overlap GPU work with the D2H wait).
+    BLOCK_M = 64
+    BLOCK_N = 128
+    BLOCK_K = 128
+    num_n_tiles_g1 = (2 * I) // BLOCK_N  # 32
+    num_n_tiles_g2 = H // BLOCK_N        # 56
+
     phase_evt = _phase_begin("phase1_route_permute")
     with _profile_region("phase1_route_permute"):
         route_outputs = _route_and_permute_local_fused(
@@ -686,6 +767,9 @@ def run(
             TOP_K=TOP_K,
             N_GROUP=N_GROUP,
             TOPK_GROUP=TOPK_GROUP,
+            BLOCK_M=BLOCK_M,
+            NUM_N_TILES_G1=num_n_tiles_g1,
+            NUM_N_TILES_G2=num_n_tiles_g2,
         )
     _phase_end(phase_evt)
 
@@ -694,12 +778,13 @@ def run(
         _finalize_phase_timing()
         return
 
-    sorted_token_ids, sorted_weights, expert_counts, expert_offsets, total_tokens = route_outputs
+    (sorted_token_ids, sorted_weights, expert_counts, expert_offsets,
+     total_tokens, tile_offsets_g1, tile_offsets_g2) = route_outputs
 
     phase_evt = _phase_begin("phase2_input_permute")
     with _profile_region("phase2_input_permute"):
-        permuted_input = hidden_states.index_select(0, sorted_token_ids.long()).contiguous()
-        permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids.long()).contiguous()
+        permuted_input = hidden_states.index_select(0, sorted_token_ids).contiguous()
+        permuted_hs_scale = hidden_states_scale.index_select(1, sorted_token_ids).contiguous()
     _phase_end(phase_evt)
 
     # ========================================================================
@@ -709,36 +794,29 @@ def run(
     # ========================================================================
     gemm1_out = torch.empty((total_tokens, 2 * I), dtype=torch.float32, device=device)
 
-    BLOCK_M = 64
-    BLOCK_N = 128
-    BLOCK_K = 128
-
-    num_n_tiles_g1 = (2 * I) // BLOCK_N  # 32
-    tile_offsets_g1 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g1, device)
-    total_tiles_g1 = int(tile_offsets_g1[-1].item())
-
     phase_evt = _phase_begin("phase3_gemm1")
     with _profile_region("phase3_gemm1"):
-        if total_tiles_g1 > 0:
-            grid_g1 = (min(NUM_SMS, total_tiles_g1),)
-            _persistent_gemm1_kernel[grid_g1](
-                permuted_input, permuted_hs_scale,
-                gemm1_weights, gemm1_weights_scale,
-                gemm1_out,
-                expert_offsets, tile_offsets_g1,
-                total_tiles_g1,
-                K=H, N=2 * I,
-                NUM_K_BLOCKS=NUM_H_BLOCKS,
-                E_LOCAL=E_local,
-                stride_a_t=permuted_input.stride(0), stride_a_k=permuted_input.stride(1),
-                stride_as_kb=permuted_hs_scale.stride(0), stride_as_t=permuted_hs_scale.stride(1),
-                stride_b_e=gemm1_weights.stride(0), stride_b_n=gemm1_weights.stride(1), stride_b_k=gemm1_weights.stride(2),
-                stride_bs_e=gemm1_weights_scale.stride(0), stride_bs_nb=gemm1_weights_scale.stride(1), stride_bs_kb=gemm1_weights_scale.stride(2),
-                stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                NUM_SMS=NUM_SMS,
-                num_warps=8, num_stages=3,
-            )
+        # grid is fixed to NUM_SMS (persistent scheduling); the kernel reads the
+        # total tile count from tile_offsets_g1[E_local] on-device, avoiding a
+        # host-side .item() sync. total_tokens > 0 guarantees tiles > 0 here.
+        grid_g1 = (NUM_SMS,)
+        _persistent_gemm1_kernel[grid_g1](
+            permuted_input, permuted_hs_scale,
+            gemm1_weights, gemm1_weights_scale,
+            gemm1_out,
+            expert_offsets, tile_offsets_g1,
+            K=H, N=2 * I,
+            NUM_K_BLOCKS=NUM_H_BLOCKS,
+            E_LOCAL=E_local,
+            stride_a_t=permuted_input.stride(0), stride_a_k=permuted_input.stride(1),
+            stride_as_kb=permuted_hs_scale.stride(0), stride_as_t=permuted_hs_scale.stride(1),
+            stride_b_e=gemm1_weights.stride(0), stride_b_n=gemm1_weights.stride(1), stride_b_k=gemm1_weights.stride(2),
+            stride_bs_e=gemm1_weights_scale.stride(0), stride_bs_nb=gemm1_weights_scale.stride(1), stride_bs_kb=gemm1_weights_scale.stride(2),
+            stride_c_t=gemm1_out.stride(0), stride_c_n=gemm1_out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            NUM_SMS=NUM_SMS,
+            num_warps=8, num_stages=3,
+        )
     _phase_end(phase_evt)
 
     # ========================================================================
@@ -768,31 +846,26 @@ def run(
     # ========================================================================
     gemm2_out = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
 
-    num_n_tiles_g2 = H // BLOCK_N  # 56
-    tile_offsets_g2 = _compute_tile_offsets(expert_counts, BLOCK_M, num_n_tiles_g2, device)
-    total_tiles_g2 = int(tile_offsets_g2[-1].item())
-
     phase_evt = _phase_begin("phase5_gemm2")
     with _profile_region("phase5_gemm2"):
-        if total_tiles_g2 > 0:
-            grid_g2 = (min(NUM_SMS, total_tiles_g2),)
-            _persistent_gemm2_kernel[grid_g2](
-                swiglu_out,
-                gemm2_weights, gemm2_weights_scale,
-                gemm2_out,
-                expert_offsets, tile_offsets_g2,
-                total_tiles_g2,
-                K=I, N=H,
-                NUM_K_BLOCKS=NUM_I_BLOCKS,
-                E_LOCAL=E_local,
-                stride_a_t=swiglu_out.stride(0), stride_a_k=swiglu_out.stride(1),
-                stride_b_e=gemm2_weights.stride(0), stride_b_n=gemm2_weights.stride(1), stride_b_k=gemm2_weights.stride(2),
-                stride_bs_e=gemm2_weights_scale.stride(0), stride_bs_nb=gemm2_weights_scale.stride(1), stride_bs_kb=gemm2_weights_scale.stride(2),
-                stride_c_t=gemm2_out.stride(0), stride_c_n=gemm2_out.stride(1),
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                NUM_SMS=NUM_SMS,
-                num_warps=8, num_stages=3,
-            )
+        # grid fixed to NUM_SMS; kernel reads tile count on-device (no .item() sync).
+        grid_g2 = (NUM_SMS,)
+        _persistent_gemm2_kernel[grid_g2](
+            swiglu_out,
+            gemm2_weights, gemm2_weights_scale,
+            gemm2_out,
+            expert_offsets, tile_offsets_g2,
+            K=I, N=H,
+            NUM_K_BLOCKS=NUM_I_BLOCKS,
+            E_LOCAL=E_local,
+            stride_a_t=swiglu_out.stride(0), stride_a_k=swiglu_out.stride(1),
+            stride_b_e=gemm2_weights.stride(0), stride_b_n=gemm2_weights.stride(1), stride_b_k=gemm2_weights.stride(2),
+            stride_bs_e=gemm2_weights_scale.stride(0), stride_bs_nb=gemm2_weights_scale.stride(1), stride_bs_kb=gemm2_weights_scale.stride(2),
+            stride_c_t=gemm2_out.stride(0), stride_c_n=gemm2_out.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            NUM_SMS=NUM_SMS,
+            num_warps=8, num_stages=3,
+        )
     _phase_end(phase_evt)
 
     # ========================================================================
