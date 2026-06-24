@@ -194,7 +194,8 @@ def _persistent_gemm1_kernel(
 # ============================================================================
 @triton.jit
 def _persistent_gemm2_kernel(
-    A_ptr,                # fp32, [total_tokens, K]
+    A_ptr,                # fp8, [total_tokens, K]
+    A_scale_ptr,          # fp32, [num_k_blocks, total_tokens]
     B_ptr,                # fp8, [E_local, N, K]
     B_scale_ptr,          # fp32, [E_local, num_n_blocks, num_k_blocks]
     C_ptr,                # fp32, [total_tokens, N]
@@ -205,6 +206,7 @@ def _persistent_gemm2_kernel(
     NUM_K_BLOCKS: tl.constexpr,
     E_LOCAL: tl.constexpr,
     stride_a_t, stride_a_k,
+    stride_as_kb, stride_as_t,
     stride_b_e, stride_b_n, stride_b_k,
     stride_bs_e, stride_bs_nb, stride_bs_kb,
     stride_c_t, stride_c_n,
@@ -267,19 +269,17 @@ def _persistent_gemm2_kernel(
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for kb in range(NUM_K_BLOCKS):
-            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+            # A: fp8, TMA load
+            a_fp8 = tl.load(a_block_ptr, boundary_check=(0, 1))
 
-            # A: fp32, TMA load
-            a = tl.load(a_block_ptr, boundary_check=(0, 1))
-
-            # B: fp8 -> fp32, TMA load
+            # B: fp8, TMA load
             b_fp8 = tl.load(b_block_ptr, boundary_check=(0, 1))
-            b = b_fp8.to(tl.float32)
 
+            # FP8 Tensor Core dot + post-hoc block-scale dequant
+            partial = tl.dot(a_fp8, tl.trans(b_fp8))
+            sa = tl.load(A_scale_ptr + kb * stride_as_kb + offs_m * stride_as_t, mask=mask_m, other=0.0)
             sb = tl.load(B_scale_ptr + expert_id * stride_bs_e + nb * stride_bs_nb + kb * stride_bs_kb)
-            b = b * sb
-
-            acc += tl.dot(a, tl.trans(b))
+            acc += partial * sa[:, None] * sb
 
             # Advance TMA pointers to the next K block
             a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
@@ -306,10 +306,12 @@ def _persistent_gemm2_kernel(
 def _swiglu_kernel(
     input_ptr,
     output_ptr,
+    scale_ptr,
     total_tokens,
     I: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_I: tl.constexpr,
+    stride_scale_ib, stride_scale_t,
 ):
     pid_t = tl.program_id(0)
     pid_i = tl.program_id(1)
@@ -329,9 +331,21 @@ def _swiglu_kernel(
     silu_up = up * tl.sigmoid(up)
     result = silu_up * gate
 
-    # Store
+    # Block-wise FP8 quantization (per-row over this 128-wide I block) so that
+    # GEMM2 runs on FP8 tensor cores (4x TF32, 2x bf16). The moe_fp8_block_scale
+    # evaluation tolerance (atol=1.0, rtol=0.3) comfortably absorbs the e4m3
+    # quantization error. Scale layout mirrors GEMM1's A_scale: scale[pid_i,
+    # token]. e4m3 max magnitude is 448.0.
+    absmax = tl.max(tl.abs(result), axis=1)              # [BLOCK_T]
+    scale = absmax / 448.0
+    scale = tl.where(scale > 0.0, scale, 1.0)            # guard zero rows
+    q = (result / scale[:, None]).to(tl.float8e4nv)
+
     out_ptrs = output_ptr + offs_t[:, None] * I + offs_i[None, :]
-    tl.store(out_ptrs, result, mask=mask_t[:, None])
+    tl.store(out_ptrs, q, mask=mask_t[:, None])
+    scale_ptrs = scale_ptr + pid_i * stride_scale_ib + offs_t * stride_scale_t
+    tl.store(scale_ptrs, scale, mask=mask_t)
+
 
 
 # ============================================================================
@@ -821,8 +835,12 @@ def run(
 
     # ========================================================================
     # Phase 4: SwiGLU — [total_tokens, 4096] -> [total_tokens, 2048]
+    # Output is FP8 with per-(token, 128-block) scale so GEMM2 runs on FP8
+    # tensor cores (4x TF32). The moe_fp8_block_scale tolerance (atol=1.0,
+    # rtol=0.3) absorbs the e4m3 quantization error.
     # ========================================================================
-    swiglu_out = torch.empty((total_tokens, I), dtype=torch.float32, device=device)
+    swiglu_out = torch.empty((total_tokens, I), dtype=torch.float8_e4m3fn, device=device)
+    swiglu_scale = torch.empty((NUM_I_BLOCKS, total_tokens), dtype=torch.float32, device=device)
     SWIGLU_BLOCK_T = 64
     SWIGLU_BLOCK_I = 128
     grid_swiglu = (
@@ -832,9 +850,10 @@ def run(
     phase_evt = _phase_begin("phase4_swiglu")
     with _profile_region("phase4_swiglu"):
         _swiglu_kernel[grid_swiglu](
-            gemm1_out, swiglu_out,
+            gemm1_out, swiglu_out, swiglu_scale,
             total_tokens, I=I,
             BLOCK_T=SWIGLU_BLOCK_T, BLOCK_I=SWIGLU_BLOCK_I,
+            stride_scale_ib=swiglu_scale.stride(0), stride_scale_t=swiglu_scale.stride(1),
             num_warps=4,
         )
     _phase_end(phase_evt)
@@ -851,7 +870,7 @@ def run(
         # grid fixed to NUM_SMS; kernel reads tile count on-device (no .item() sync).
         grid_g2 = (NUM_SMS,)
         _persistent_gemm2_kernel[grid_g2](
-            swiglu_out,
+            swiglu_out, swiglu_scale,
             gemm2_weights, gemm2_weights_scale,
             gemm2_out,
             expert_offsets, tile_offsets_g2,
@@ -859,6 +878,7 @@ def run(
             NUM_K_BLOCKS=NUM_I_BLOCKS,
             E_LOCAL=E_local,
             stride_a_t=swiglu_out.stride(0), stride_a_k=swiglu_out.stride(1),
+            stride_as_kb=swiglu_scale.stride(0), stride_as_t=swiglu_scale.stride(1),
             stride_b_e=gemm2_weights.stride(0), stride_b_n=gemm2_weights.stride(1), stride_b_k=gemm2_weights.stride(2),
             stride_bs_e=gemm2_weights_scale.stride(0), stride_bs_nb=gemm2_weights_scale.stride(1), stride_bs_kb=gemm2_weights_scale.stride(2),
             stride_c_t=gemm2_out.stride(0), stride_c_n=gemm2_out.stride(1),

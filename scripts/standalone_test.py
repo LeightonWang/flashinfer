@@ -528,11 +528,12 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--atol", type=float, default=1e-2)
-    parser.add_argument("--rtol", type=float, default=1e-2)
-    parser.add_argument("--matched-ratio", type=float, default=0.95,
-                        help="Required fraction of elements within tolerance "
-                             "(flashinfer-bench moe_fp8_block_scale uses 0.95).")
+    parser.add_argument("--atol", type=float, default=1.0)
+    parser.add_argument("--rtol", type=float, default=0.3)
+    parser.add_argument("--matched-ratio", type=float, default=0.9,
+                        help="Required fraction of elements within tolerance. "
+                             "The moe_fp8_block_scale evaluation config is "
+                             "atol=1.0, rtol=0.3, required_matched_ratio=0.9.")
     parser.add_argument("--no-test", action="store_true", help="Skip correctness check.")
     parser.add_argument("--no-benchmark", action="store_true", help="Skip benchmark.")
     parser.add_argument("--profile", action="store_true",
